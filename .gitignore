@@ -1,0 +1,46 @@
+# Intermediates (never commit, always regenerated)
+.tmp/
+
+# Environment variables and API keys
+.env
+.env.local
+
+# Google OAuth credentials
+credentials.json
+token.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Nested repositories or clones
+chest x-ray VLM/
+
