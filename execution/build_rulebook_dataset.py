@@ -2,16 +2,23 @@
 ChestXStudio-VLM: Multi-Dataset Ingestion & 5-Rule CoT Training Data Synthesizer
 Path: execution/build_rulebook_dataset.py
 
-Converts multi-institutional chest X-ray datasets (ChestX-Det, VinDr-CXR,
-NIH ChestX-ray14, CheXpert, MIMIC-CXR, OpenI, or custom JSONL) into strictly
-formatted 5-Rule Clinical Rulebook training samples for SmolVLM-500M-Instruct.
+Converts multi-institutional chest X-ray datasets (ChestX-Det, PadChest-GR,
+CheXpert, SIIM-Pneumothorax, VinDr-CXR, or custom JSONL) into strictly formatted
+5-Rule Clinical Rulebook training samples for SmolVLM-500M-Instruct.
 
-Key anti-hallucination design features:
-  1. Converts bounding boxes [x1, y1, x2, y2] -> exact anatomical zones (Rule 3).
-  2. Enforces Observation Before Etiology (Rule 2) & Explicit Negatives (Rule 4).
-  3. Rebalances class frequencies (caps Normal ratio, oversamples acute/rare classes)
-     to eliminate "Normal-biased" hallucination.
-  4. Emits Dual-Mode training examples (Pure-Image CoT + CAD-Grounded CoT).
+Upgrades in v2 audited synthesizer:
+1. Disk-safe HuggingFace streaming (`streaming=True`) + on-the-fly 512x512 RGB JPEG
+   caching into `--img-cache-dir` (safe for Kaggle's 20 GB /kaggle/working cap).
+2. Patient/image-level train/val splitting BEFORE oversampling or mode expansion
+   (zero data leakage between train.jsonl and val.jsonl).
+3. Word-boundary canonical label matching (fixes "ild" matching inside "mild" and
+   blocks negated raw labels).
+4. 3-Mode "Rulebook + Authenticator" training mix:
+   - 40% Pure-Image CoT
+   - 35% CAD-Aligned Verification
+   - 25% CAD-Authenticator Hard Negatives / Rejection (Normal FP, Abnormal Distractor,
+     and Laterality Flip subtypes) using identical CAD prompt phrasing so the VLM
+     must inspect pixels rather than memorize prompt cues.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -30,12 +38,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from execution.analyze_xray import SYSTEM_RULEBOOK
 
 # =====================================================================
-# 1. UNIFIED THORACIC PATHOLOGY & OBSERVATION ONTOLOGY (24 ETIOLOGIES)
+# 1. UNIFIED THORACIC PATHOLOGY & OBSERVATION ONTOLOGY (25 ETIOLOGIES)
 # =====================================================================
 PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Pneumothorax": {
         "aliases": ["pneumothorax", "ptx"],
         "observation": "a fine visceral pleural line with peripheral radiolucency and absence of distal pulmonary vascular markings",
+        "neg_visual": "intact peripheral pulmonary vascular markings extending to the chest wall without a visible visceral pleural line",
         "clinical_name": "pneumothorax",
         "urgency": 1,
         "default_zone": "apical/lateral pleural space",
@@ -43,6 +52,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Effusion": {
         "aliases": ["effusion", "pleural effusion"],
         "observation": "homogeneous dependent opacity blunting the costophrenic angle with a concave meniscus contour",
+        "neg_visual": "sharp, clear costophrenic angles without dependent meniscus blunting",
         "clinical_name": "pleural effusion",
         "urgency": 2,
         "default_zone": "lower pleural space and costophrenic recess",
@@ -50,6 +60,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Consolidation": {
         "aliases": ["consolidation", "airspace consolidation"],
         "observation": "confluent homogeneous parenchymal airspace opacification obscuring underlying pulmonary vessels",
+        "neg_visual": "clear, well-aerated lung parenchyma without confluent airspace opacification",
         "clinical_name": "focal consolidation",
         "urgency": 3,
         "default_zone": "pulmonary parenchymal zone",
@@ -57,6 +68,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Pneumonia": {
         "aliases": ["pneumonia"],
         "observation": "patchy-to-confluent alveolar airspace opacity with ill-defined borders",
+        "neg_visual": "no focal alveolar airspace opacity to suggest infectious consolidation",
         "clinical_name": "pneumonia / infectious airspace process",
         "urgency": 3,
         "default_zone": "pulmonary parenchyma",
@@ -64,6 +76,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Edema": {
         "aliases": ["edema", "pulmonary edema", "vascular congestion"],
         "observation": "perihilar haziness, indistinct pulmonary vascular margins, and cephalization of upper-lobe vessels",
+        "neg_visual": "crisp pulmonary vascular margins without perihilar haziness or Kerley lines",
         "clinical_name": "pulmonary edema / vascular congestion",
         "urgency": 3,
         "default_zone": "bilateral perihilar and basilar lung fields",
@@ -71,6 +84,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Atelectasis": {
         "aliases": ["atelectasis", "linear atelectasis", "subsegmental atelectasis"],
         "observation": "linear or wedge-shaped parenchymal density accompanied by subtle regional volume loss",
+        "neg_visual": "preserved lung volumes without linear or wedge-shaped parenchymal collapse",
         "clinical_name": "atelectasis",
         "urgency": 5,
         "default_zone": "mid-to-lower lung zone",
@@ -78,6 +92,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Cardiomegaly": {
         "aliases": ["cardiomegaly"],
         "observation": "transverse enlargement of the cardiac silhouette with cardiothoracic ratio exceeding 0.50",
+        "neg_visual": "a normal cardiac silhouette with cardiothoracic ratio within normal limits",
         "clinical_name": "cardiomegaly",
         "urgency": 4,
         "default_zone": "central mediastinum and cardiac silhouette",
@@ -85,13 +100,15 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Enlarged Cardiomediastinum": {
         "aliases": ["enlarged cardiomediastinum", "mediastinal widening", "widened mediastinum"],
         "observation": "widened superior and central cardiomediastinal contour",
+        "neg_visual": "a normal superior and central cardiomediastinal contour without widening",
         "clinical_name": "enlarged cardiomediastinal silhouette",
         "urgency": 4,
         "default_zone": "central mediastinum",
     },
     "Aortic Enlargement": {
-        "aliases": ["aortic enlargement", "aortic tortuosity", "aortic unfolding", "prominent aorta"],
+        "aliases": ["aortic enlargement", "aortic tortuosity", "aortic unfolding", "aortic elongation", "prominent aorta"],
         "observation": "prominence and tortuous unfolding of the thoracic aortic knob contour",
+        "neg_visual": "an unremarkable thoracic aortic knob contour without abnormal unfolding",
         "clinical_name": "aortic enlargement / tortuosity",
         "urgency": 6,
         "default_zone": "superior mediastinum / aortic arch",
@@ -99,6 +116,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Mediastinal Shift": {
         "aliases": ["mediastinal shift", "tracheal deviation"],
         "observation": "lateral displacement of the trachea and central mediastinal structures",
+        "neg_visual": "a midline trachea and normally positioned central mediastinal structures",
         "clinical_name": "mediastinal shift",
         "urgency": 1,
         "default_zone": "central mediastinum",
@@ -106,6 +124,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Lung Opacity": {
         "aliases": ["lung opacity", "airspace opacity", "pulmonary opacity"],
         "observation": "focal or patchy parenchymal opacity partially obscuring vascular markings",
+        "neg_visual": "uniformly aerated lung fields without focal parenchymal opacity",
         "clinical_name": "pulmonary airspace opacity",
         "urgency": 5,
         "default_zone": "lung parenchyma",
@@ -113,20 +132,23 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Infiltration": {
         "aliases": ["infiltration", "infiltrate"],
         "observation": "ill-defined patchy interstitial and alveolar parenchymal opacification",
+        "neg_visual": "clear lung fields without patchy alveolar or interstitial infiltrate",
         "clinical_name": "pulmonary infiltrate",
         "urgency": 5,
         "default_zone": "lung parenchyma",
     },
     "ILD": {
-        "aliases": ["ild", "interstitial lung disease", "reticular opacity"],
+        "aliases": ["ild", "interstitial lung disease", "reticular opacity", "interstitial pattern"],
         "observation": "diffuse reticular and reticulonodular interstitial markings throughout the parenchyma",
+        "neg_visual": "normal bronchovascular markings without diffuse reticular interstitial thickening",
         "clinical_name": "interstitial lung abnormality",
         "urgency": 5,
         "default_zone": "bilateral lung fields",
     },
     "Mass": {
-        "aliases": ["mass", "pulmonary mass"],
+        "aliases": ["mass", "pulmonary mass", "lung mass"],
         "observation": "discrete rounded or lobulated focal opacity measuring greater than 3 cm",
+        "neg_visual": "no discrete rounded or lobulated pulmonary mass lesion",
         "clinical_name": "pulmonary mass",
         "urgency": 2,
         "default_zone": "pulmonary parenchyma",
@@ -134,6 +156,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Nodule": {
         "aliases": ["nodule", "nodule/mass", "diffuse nodule", "pulmonary nodule"],
         "observation": "circumscribed focal nodular radio-opacity with distinct parenchymal borders",
+        "neg_visual": "no discrete focal pulmonary nodule identified",
         "clinical_name": "pulmonary nodule",
         "urgency": 3,
         "default_zone": "pulmonary parenchyma",
@@ -141,6 +164,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Lung Cavity": {
         "aliases": ["lung cavity", "cavitation", "cavitary lesion"],
         "observation": "thick-walled parenchymal opacity containing a central radiolucent air-filled cavity",
+        "neg_visual": "no thick-walled cavitary parenchymal lesion",
         "clinical_name": "cavitary pulmonary lesion",
         "urgency": 2,
         "default_zone": "upper-to-mid lung zone",
@@ -148,6 +172,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Lung Cyst": {
         "aliases": ["lung cyst", "bulla", "bleb"],
         "observation": "thin-walled circumscribed radiolucent air space within the parenchyma",
+        "neg_visual": "no circumscribed thin-walled pulmonary cyst or bulla",
         "clinical_name": "pulmonary cyst / bulla",
         "urgency": 6,
         "default_zone": "lung parenchyma",
@@ -155,6 +180,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Lung Lesion": {
         "aliases": ["lung lesion", "other lesion", "lesion"],
         "observation": "focal parenchymal lesion distorting local pulmonary architecture",
+        "neg_visual": "no discrete focal parenchymal lesion",
         "clinical_name": "focal pulmonary lesion",
         "urgency": 4,
         "default_zone": "lung parenchyma",
@@ -162,6 +188,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Emphysema": {
         "aliases": ["emphysema", "hyperinflation", "copd"],
         "observation": "hyperinflated bilateral lung fields with increased radiolucency and flattened hemidiaphragms",
+        "neg_visual": "normal lung volumes and smoothly domed hemidiaphragms without hyperinflation",
         "clinical_name": "pulmonary emphysema / hyperinflation",
         "urgency": 5,
         "default_zone": "bilateral lung fields",
@@ -169,20 +196,23 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Fibrosis": {
         "aliases": ["fibrosis", "pulmonary fibrosis"],
         "observation": "coarse linear reticular bands with parenchymal architectural distortion and traction",
+        "neg_visual": "no coarse fibrotic reticular scarring or architectural distortion",
         "clinical_name": "pulmonary fibrosis",
         "urgency": 5,
         "default_zone": "lung parenchyma",
     },
     "Pleural Thickening": {
-        "aliases": ["pleural thickening", "pleural_thickening", "apical cap"],
+        "aliases": ["pleural thickening", "pleural_thickening", "apical cap", "apical pleural thickening"],
         "observation": "focal linear thickening along the peripheral or apical pleural margin",
+        "neg_visual": "smooth peripheral and apical pleural margins without focal thickening",
         "clinical_name": "pleural thickening",
         "urgency": 6,
         "default_zone": "peripheral pleural margin",
     },
     "Calcification": {
-        "aliases": ["calcification", "calcified granuloma", "aortic calcification"],
+        "aliases": ["calcification", "calcified granuloma", "aortic calcification", "granuloma"],
         "observation": "well-defined high-attenuation punctate or curvilinear calcific density",
+        "neg_visual": "no suspicious focal parenchymal calcification",
         "clinical_name": "thoracic calcification / calcified granuloma",
         "urgency": 7,
         "default_zone": "lung parenchyma or aortic arch",
@@ -190,6 +220,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Fracture": {
         "aliases": ["fracture", "rib fracture", "clavicle fracture"],
         "observation": "focal cortical step-off and lucency disrupting the osseous contour",
+        "neg_visual": "intact cortical margins across the visualized ribs and clavicles without acute fracture",
         "clinical_name": "rib or clavicular fracture",
         "urgency": 3,
         "default_zone": "osseous thoracic cage",
@@ -197,13 +228,18 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
     "Hernia": {
         "aliases": ["hernia", "hiatal hernia"],
         "observation": "retrocardiac soft-tissue/gas-containing density projecting above the diaphragm",
+        "neg_visual": "an unremarkable retrocardiac region without hiatal herniation",
         "clinical_name": "hiatal hernia",
         "urgency": 6,
         "default_zone": "retrocardiac lower mediastinum",
     },
     "Support Devices": {
-        "aliases": ["support devices", "pacemaker", "endotracheal tube", "central line", "chest tube"],
+        "aliases": [
+            "support devices", "pacemaker", "endotracheal tube", "central line",
+            "chest tube", "catheter", "sternotomy", "prosthesis",
+        ],
         "observation": "radiopaque medical hardware / support device projecting over the thorax",
+        "neg_visual": "no radiopaque intrathoracic tubes, lines, or implanted hardware",
         "clinical_name": "thoracic support device",
         "urgency": 7,
         "default_zone": "mediastinum / thoracic wall",
@@ -216,16 +252,57 @@ for _canon, _meta in PATHOLOGY_ONTOLOGY.items():
     for _alias in _meta["aliases"]:
         _ALIAS_TO_CANONICAL[_alias.lower()] = _canon
 
+# Longest aliases first + strict word boundaries so "ild" never matches inside "mild"
+_SORTED_ALIAS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)"), canon)
+    for alias, canon in sorted(_ALIAS_TO_CANONICAL.items(), key=lambda kv: len(kv[0]), reverse=True)
+]
+
+_NEGATED_RAW_PREFIXES = ("no ", "without ", "negative for ", "normal ", "unchanged normal")
+
+# High-value distractors used for Mode 3 false-positive CAD alerts
+_DISTRACTOR_POOL: list[str] = [
+    "Pneumothorax",
+    "Effusion",
+    "Consolidation",
+    "Edema",
+    "Cardiomegaly",
+    "Mass",
+    "Nodule",
+    "Atelectasis",
+    "Fracture",
+    "Emphysema",
+    "Fibrosis",
+    "Pleural Thickening",
+]
+
+_DISTRACTOR_ZONES: dict[str, list[str]] = {
+    "Pneumothorax": ["right apical pleural space", "left apical pleural space", "right apicolateral pleural space"],
+    "Effusion": ["right costophrenic angle and lower pleural space", "left costophrenic angle and lower pleural space"],
+    "Consolidation": ["right lower lung zone / lung base", "left lower lung zone / lung base", "right mid lung zone"],
+    "Edema": ["bilateral perihilar and basilar lung fields"],
+    "Cardiomegaly": ["central mediastinum and cardiac silhouette"],
+    "Mass": ["right upper lung zone (apical)", "left mid lung zone"],
+    "Nodule": ["right mid lung zone", "left upper lung zone (apical)"],
+    "Atelectasis": ["left lower lung zone / lung base", "right lower lung zone / lung base"],
+    "Fracture": ["right osseous thoracic cage", "left osseous thoracic cage"],
+    "Emphysema": ["bilateral lung fields"],
+    "Fibrosis": ["bilateral lung fields"],
+    "Pleural Thickening": ["right apical pleural margin", "left apical pleural margin"],
+}
+
 
 def canonicalize_label(raw_label: str) -> str | None:
-    """Maps raw dataset label names into the unified 25-pathology ontology."""
+    """Maps raw dataset label names into the unified 25-pathology ontology safely."""
     cleaned = raw_label.strip().lower().replace("_", " ")
-    if cleaned in ("no finding", "normal", "none", ""):
+    if not cleaned or cleaned in ("no finding", "normal", "none", "unchanged", "suboptimal study"):
+        return None
+    if cleaned.startswith(_NEGATED_RAW_PREFIXES):
         return None
     if cleaned in _ALIAS_TO_CANONICAL:
         return _ALIAS_TO_CANONICAL[cleaned]
-    for alias, canon in _ALIAS_TO_CANONICAL.items():
-        if alias in cleaned:
+    for pattern, canon in _SORTED_ALIAS_PATTERNS:
+        if pattern.search(cleaned):
             return canon
     return None
 
@@ -255,7 +332,6 @@ def bbox_to_anatomical_zone(
         return PATHOLOGY_ONTOLOGY[canonical_label]["default_zone"]
 
     x1, y1, x2, y2 = [float(v) for v in bbox]
-    # Normalize if pixel coordinates were provided
     if max(x1, y1, x2, y2) > 1.5:
         x1 /= max(img_w, 1)
         x2 /= max(img_w, 1)
@@ -299,16 +375,30 @@ def bbox_to_anatomical_zone(
     return f"{side} {zone}"
 
 
+def _flip_laterality(zone: str) -> str | None:
+    """Flips right <-> left in an anatomical zone string for Mode 3c laterality hard negatives."""
+    has_right = bool(re.search(r"\bright\b", zone, flags=re.IGNORECASE))
+    has_left = bool(re.search(r"\bleft\b", zone, flags=re.IGNORECASE))
+    if has_right == has_left:
+        return None
+    tmp = re.sub(r"\bright\b", "__SIDE_SWAP__", zone, flags=re.IGNORECASE)
+    tmp = re.sub(r"\bleft\b", "right", tmp, flags=re.IGNORECASE)
+    return tmp.replace("__SIDE_SWAP__", "left")
+
+
 # =====================================================================
 # 3. STRICT 5-RULE REPORT SYNTHESIZER & VALIDATOR
 # =====================================================================
 def build_rulebook_target(
     findings: list[dict[str, Any]],
     raw_report_note: str | None = None,
+    rejected_cad_notes: list[str] | None = None,
 ) -> str:
     """
     Synthesizes a strictly rule-compliant 3-section radiological report from
-    grounded dataset annotations (`findings`: [{label, zone, confidence?}]).
+    grounded dataset annotations (`findings`: [{label, zone}]).
+    Optional `rejected_cad_notes` adds visual refutation sentences in Section 1
+    for Mode 3 (CAD-Authenticator Rejection) without contaminating Sections 2-3.
     """
     deduped: dict[str, dict[str, Any]] = {}
     for item in findings:
@@ -340,18 +430,23 @@ def build_rulebook_target(
         name for keys, name in acute_neg_checks
         if not (keys & present_canons)
     ]
-    neg_sentence = (
-        f"No radiographic evidence of {', '.join(explicit_negatives)}."
-        if explicit_negatives else ""
-    )
+    if explicit_negatives:
+        neg_sentence = f"No radiographic evidence of {', '.join(explicit_negatives)}."
+    else:
+        neg_sentence = "No radiographic evidence of free subdiaphragmatic air."
+
+    refutation_block = " ".join(note.strip() for note in (rejected_cad_notes or []) if note.strip())
 
     if not ordered:
-        sec1 = (
-            "The trachea and central airways are midline and patent. "
-            "Bilateral lung fields are well-aerated and clear without focal airspace opacity or pleural abnormality. "
-            "The cardiomediastinal silhouette is normal in size and contour, and the thoracic skeleton is intact. "
-            f"{neg_sentence}"
-        ).strip()
+        sec1_parts = [
+            "The trachea and central airways are midline and patent.",
+            "Bilateral lung fields are well-aerated and clear without focal airspace opacity or pleural abnormality.",
+            "The cardiomediastinal silhouette is normal in size and contour, and the thoracic skeleton is intact.",
+        ]
+        if refutation_block:
+            sec1_parts.append(refutation_block)
+        sec1_parts.append(neg_sentence)
+        sec1 = " ".join(sec1_parts)
         sec2 = "Bilateral lung fields, costophrenic angles, central mediastinum, and osseous structures (unremarkable)."
         sec3 = "No acute cardiopulmonary abnormality identified on this frontal chest radiograph."
     else:
@@ -378,9 +473,9 @@ def build_rulebook_target(
             clean_note = raw_report_note.strip().rstrip(".")
             if 10 < len(clean_note) < 160:
                 obs_sentences.append(f"{clean_note}.")
-
-        if neg_sentence:
-            obs_sentences.append(neg_sentence)
+        if refutation_block:
+            obs_sentences.append(refutation_block)
+        obs_sentences.append(neg_sentence)
 
         sec1 = " ".join(obs_sentences)
         sec2 = "; ".join(loc_entries) + "."
@@ -416,7 +511,7 @@ def validate_rulebook_compliance(report: str) -> tuple[bool, list[str]]:
 
 
 # =====================================================================
-# 4. DATASET LOADERS & CLASS-BALANCED SAMPLING
+# 4. DISK-SAFE STREAMING DATASET LOADERS
 # =====================================================================
 CHESTX_DET_ID2LABEL: dict[int, str] = {
     1: "Atelectasis",
@@ -435,35 +530,54 @@ CHESTX_DET_ID2LABEL: dict[int, str] = {
 }
 
 
-def load_chestx_det_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
+def _save_resized_image(pil_img: Any, out_path: Path, image_size: int = 512) -> str:
+    """Saves a compact 512x512 RGB JPEG (~40 KB) so Kaggle disk never overflows."""
+    from PIL import Image
+
+    if not out_path.exists():
+        resample = getattr(Image, "Resampling", Image).BILINEAR
+        rgb = pil_img.convert("RGB")
+        if rgb.size != (image_size, image_size):
+            rgb = rgb.resize((image_size, image_size), resample)
+        rgb.save(out_path, format="JPEG", quality=95)
+    return str(out_path)
+
+
+def load_chestx_det_hf(
+    max_samples: int | None = None,
+    img_cache_dir: str = "./.tmp/training_images",
+    image_size: int = 512,
+    split: str = "train",
+    streaming: bool = True,
+) -> list[dict[str, Any]]:
     """
-    Loads `natealberti/ChestX-Det` from HuggingFace (13 thoracic classes).
+    Streams `natealberti/ChestX-Det` from HuggingFace (13 thoracic classes).
     Extracts exact class IDs and bounding boxes directly from the `label` pixel mask
     (`255` = Background, `1..13` = ChestX-Det pathology categories).
     """
     import numpy as np
-    from datasets import load_dataset  # Lazy import so inference runtime stays slim
+    from datasets import load_dataset
 
-    ds = load_dataset("natealberti/ChestX-Det", split="train")
+    ds = load_dataset("natealberti/ChestX-Det", split=split, streaming=streaming)
     records: list[dict[str, Any]] = []
-    out_img_dir = Path("./.tmp/training_images/chestx_det")
+    out_img_dir = Path(img_cache_dir) / f"chestx_det_{split}"
     out_img_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, row in enumerate(ds):
-        if max_samples and idx >= max_samples:
+        if max_samples and len(records) >= max_samples:
             break
         pil_img = row.get("image")
         lbl_img = row.get("label")
         if pil_img is None:
             continue
         img_w, img_h = pil_img.size
-        img_file = out_img_dir / f"chestx_det_{idx:06d}.png"
-        if not img_file.exists():
-            pil_img.save(img_file)
+        img_file = _save_resized_image(pil_img, out_img_dir / f"chestx_det_{split}_{idx:06d}.jpg", image_size)
 
         findings: list[dict[str, Any]] = []
         if lbl_img is not None:
             lbl_arr = np.asarray(lbl_img)
+            if lbl_arr.ndim == 3:
+                lbl_arr = lbl_arr[..., 0]
             for uid in np.unique(lbl_arr):
                 uid_int = int(uid)
                 if uid_int == 255 or uid_int not in CHESTX_DET_ID2LABEL:
@@ -479,57 +593,83 @@ def load_chestx_det_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
                 })
 
         records.append({
-            "source": "ChestX-Det",
-            "image_path": str(img_file),
+            "source": f"ChestX-Det-{split}",
+            "group_id": f"chestx_det_{split}_{idx:06d}",
+            "image_path": img_file,
             "findings": findings,
         })
+    print(f"[Loader] ChestX-Det ({split}): loaded {len(records)} studies")
     return records
 
 
-def load_chexpert_hf(max_samples: int | None = None, frontal_only: bool = True) -> list[dict[str, Any]]:
-    """Loads `danjacobellis/chexpert` from HuggingFace (positive label == 3)."""
+def load_chexpert_hf(
+    max_samples: int | None = None,
+    frontal_only: bool = True,
+    img_cache_dir: str = "./.tmp/training_images",
+    image_size: int = 512,
+    streaming: bool = True,
+) -> list[dict[str, Any]]:
+    """Streams `danjacobellis/chexpert` from HuggingFace (Frontal == 0, positive == 3)."""
     from datasets import load_dataset
 
-    ds = load_dataset("danjacobellis/chexpert", split="train")
+    ds = load_dataset("danjacobellis/chexpert", split="train", streaming=streaming)
     chex_cols = [
         "Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion",
         "Edema", "Consolidation", "Pneumonia", "Atelectasis", "Pneumothorax",
         "Pleural Effusion", "Pleural Other", "Fracture", "Support Devices",
     ]
-    out_img_dir = Path("./.tmp/training_images/chexpert")
+    out_img_dir = Path(img_cache_dir) / "chexpert"
     out_img_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
 
     for idx, row in enumerate(ds):
         if max_samples and len(records) >= max_samples:
             break
-        if frontal_only and str(row.get("Frontal/Lateral")) != "0":
+        fl_val = str(row.get("Frontal/Lateral", "")).strip().lower()
+        if frontal_only and fl_val not in ("0", "frontal"):
             continue
         pil_img = row.get("image")
         if pil_img is None:
             continue
-        img_file = out_img_dir / f"chexpert_{idx:06d}.png"
-        if not img_file.exists():
-            pil_img.save(img_file)
+
+        img_file = _save_resized_image(pil_img, out_img_dir / f"chexpert_{idx:06d}.jpg", image_size)
         findings = []
         for col in chex_cols:
-            if str(row.get(col)) == "3":
+            val = row.get(col)
+            if val == 3 or str(val).strip() == "3":
                 canon = canonicalize_label(col)
                 if canon:
                     findings.append({
                         "label": canon,
                         "zone": PATHOLOGY_ONTOLOGY[canon]["default_zone"],
                     })
-        records.append({"source": "CheXpert", "image_path": str(img_file), "findings": findings})
+
+        raw_path = str(row.get("Path") or row.get("path") or "")
+        pat_match = re.search(r"patient\d+", raw_path, flags=re.IGNORECASE)
+        group_id = f"chexpert_{pat_match.group(0).lower()}" if pat_match else f"chexpert_{idx:06d}"
+
+        records.append({
+            "source": "CheXpert",
+            "group_id": group_id,
+            "image_path": img_file,
+            "findings": findings,
+        })
+    print(f"[Loader] CheXpert (train): loaded {len(records)} frontal studies")
     return records
 
 
-def load_padchest_gr_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
-    """Loads `JasonZZ0601/PadChest-GR-Xray` (grounded findings, locations & sentences)."""
+def load_padchest_gr_hf(
+    max_samples: int | None = None,
+    img_cache_dir: str = "./.tmp/training_images",
+    image_size: int = 512,
+    split: str = "train",
+    streaming: bool = True,
+) -> list[dict[str, Any]]:
+    """Streams `JasonZZ0601/PadChest-GR-Xray` without downloading the full 75 GB archive."""
     from datasets import load_dataset
 
-    ds = load_dataset("JasonZZ0601/PadChest-GR-Xray", split="train")
-    out_img_dir = Path("./.tmp/training_images/padchest_gr")
+    ds = load_dataset("JasonZZ0601/PadChest-GR-Xray", split=split, streaming=streaming)
+    out_img_dir = Path(img_cache_dir) / f"padchest_gr_{split}"
     out_img_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
 
@@ -539,27 +679,97 @@ def load_padchest_gr_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
         pil_img = row.get("image")
         if pil_img is None:
             continue
-        img_file = out_img_dir / f"padchest_{idx:06d}.png"
-        if not img_file.exists():
-            pil_img.save(img_file)
-        lbl = str(row.get("label", ""))
+        img_w, img_h = pil_img.size
+        img_file = _save_resized_image(pil_img, out_img_dir / f"padchest_{split}_{idx:06d}.jpg", image_size)
+
+        raw_lbl = row.get("label") if row.get("label") is not None else row.get("labels", "")
+        if isinstance(raw_lbl, list):
+            parts = [str(x) for x in raw_lbl]
+        else:
+            parts = [p for p in str(raw_lbl).split(",")]
+
         locs = row.get("locations") or []
-        loc_str = " ".join(str(x) for x in locs) if isinstance(locs, list) else str(locs)
+        loc_str = " ".join(str(x) for x in locs if x) if isinstance(locs, list) else str(locs or "")
+        boxes = row.get("boxes") or row.get("bbox") or None
+        first_box = None
+        if isinstance(boxes, list) and boxes:
+            if isinstance(boxes[0], (list, tuple)) and len(boxes[0]) == 4:
+                first_box = boxes[0]
+            elif len(boxes) == 4 and all(isinstance(v, (int, float)) for v in boxes):
+                first_box = boxes
+
         findings = []
-        for part in lbl.split(","):
+        for part in parts:
             canon = canonicalize_label(part)
             if canon:
-                findings.append({
-                    "label": canon,
-                    "zone": loc_str.strip() or PATHOLOGY_ONTOLOGY[canon]["default_zone"],
-                })
-        note = str(row.get("sentence_en") or "")
+                if first_box is not None:
+                    zone = bbox_to_anatomical_zone(first_box, canon, img_w=img_w, img_h=img_h)
+                else:
+                    zone = loc_str.strip() or PATHOLOGY_ONTOLOGY[canon]["default_zone"]
+                findings.append({"label": canon, "zone": zone})
+
+        note = str(row.get("sentence_en") or "").strip()
+        group_raw = row.get("PatientID") or row.get("patient_id") or row.get("ImageID") or f"{idx:06d}"
+
         records.append({
-            "source": "PadChest-GR",
-            "image_path": str(img_file),
+            "source": f"PadChest-GR-{split}",
+            "group_id": f"padchest_{split}_{group_raw}",
+            "image_path": img_file,
             "findings": findings,
-            "note": None if note == "None" else note,
+            "note": None if (not note or note.lower() == "none") else note,
         })
+    print(f"[Loader] PadChest-GR ({split}): loaded {len(records)} studies")
+    return records
+
+
+def load_siim_pneumo_hf(
+    max_samples: int | None = None,
+    img_cache_dir: str = "./.tmp/training_images",
+    image_size: int = 512,
+    streaming: bool = True,
+) -> list[dict[str, Any]]:
+    """Streams `nwirandx/siim-pneumothorax-256-2400` for high-recall Pneumothorax bbox grounding."""
+    import numpy as np
+    from datasets import load_dataset
+
+    ds = load_dataset("nwirandx/siim-pneumothorax-256-2400", split="train", streaming=streaming)
+    out_img_dir = Path(img_cache_dir) / "siim_pneumo"
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(ds):
+        if max_samples and len(records) >= max_samples:
+            break
+        pil_img = row.get("image")
+        if pil_img is None:
+            continue
+        img_w, img_h = pil_img.size
+        img_file = _save_resized_image(pil_img, out_img_dir / f"siim_pneumo_{idx:06d}.jpg", image_size)
+
+        has_pneumo = int(row.get("has_pneumo", 0) or 0) == 1
+        findings: list[dict[str, Any]] = []
+        if has_pneumo:
+            mask_img = row.get("mask")
+            box = None
+            if mask_img is not None:
+                m_arr = np.asarray(mask_img)
+                if m_arr.ndim == 3:
+                    m_arr = m_arr[..., 0]
+                ys, xs = np.where(m_arr > 0)
+                if len(xs) > 0:
+                    box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+            findings.append({
+                "label": "Pneumothorax",
+                "zone": bbox_to_anatomical_zone(box, "Pneumothorax", img_w=img_w, img_h=img_h),
+            })
+
+        records.append({
+            "source": "SIIM-Pneumothorax",
+            "group_id": f"siim_pneumo_{idx:06d}",
+            "image_path": img_file,
+            "findings": findings,
+        })
+    print(f"[Loader] SIIM-Pneumothorax: loaded {len(records)} studies")
     return records
 
 
@@ -592,6 +802,7 @@ def load_vindr_csv(csv_path: str, image_dir: str, max_samples: int | None = None
         ]
         records.append({
             "source": "VinDr-CXR",
+            "group_id": f"vindr_{img_id}",
             "image_path": str(img_path),
             "findings": findings,
         })
@@ -599,13 +810,10 @@ def load_vindr_csv(csv_path: str, image_dir: str, max_samples: int | None = None
 
 
 def load_generic_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
-    """
-    Loads custom JSONL annotations:
-      {"image_path": "...", "findings": [{"label": "...", "bbox": [x1,y1,x2,y2], "zone": "..."}]}
-    """
+    """Loads custom JSONL annotations: {image_path, findings: [{label, bbox?, zone?}]}."""
     records: list[dict[str, Any]] = []
     with open(jsonl_path, encoding="utf-8") as f:
-        for line in f:
+        for idx, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
@@ -619,6 +827,7 @@ def load_generic_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
                 norm_findings.append({"label": canon, "zone": zone})
             records.append({
                 "source": item.get("source", "custom"),
+                "group_id": item.get("group_id") or f"custom_{idx:06d}",
                 "image_path": item["image_path"],
                 "findings": norm_findings,
                 "note": item.get("note"),
@@ -626,17 +835,50 @@ def load_generic_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
     return records
 
 
+# =====================================================================
+# 5. LEAK-FREE SPLITTING, REBALANCING & 3-MODE AUTHENTICATOR FORMATTING
+# =====================================================================
+def split_records_by_group(
+    records: list[dict[str, Any]],
+    val_ratio: float = 0.10,
+    seed: int = 42,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Splits studies by patient/image group_id BEFORE oversampling so zero images leak into val."""
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for idx, rec in enumerate(records):
+        gid = rec.get("group_id") or rec.get("image_path") or f"rec_{idx}"
+        grouped[gid].append(rec)
+
+    group_ids = list(grouped.keys())
+    rng = random.Random(seed)
+    rng.shuffle(group_ids)
+
+    if len(group_ids) <= 1:
+        return list(records), list(records)
+
+    val_n_groups = max(1, int(round(len(group_ids) * val_ratio)))
+    val_gids = set(group_ids[:val_n_groups])
+
+    train_recs: list[dict[str, Any]] = []
+    val_recs: list[dict[str, Any]] = []
+    for gid, recs in grouped.items():
+        if gid in val_gids:
+            val_recs.extend(recs)
+        else:
+            train_recs.extend(recs)
+    return train_recs, val_recs
+
+
 def balance_records_against_normal_bias(
     records: list[dict[str, Any]],
-    max_normal_ratio: float = 0.22,
-    min_class_count: int = 200,
+    max_normal_ratio: float = 0.20,
+    min_class_count: int = 300,
     seed: int = 42,
 ) -> list[dict[str, Any]]:
     """
     Rebalances training dataset to eradicate "Normal-biased" hallucination:
-      - Downsamples Normal-only records to at most `max_normal_ratio` of total abnormal records.
-      - Oversamples underrepresented etiologies (Pneumothorax, Mass, Fracture, Cavity, etc.)
-        up to `min_class_count` occurrences.
+    - Caps Normal-only studies to at most `max_normal_ratio` of final training set.
+    - Oversamples underrepresented etiologies up to `min_class_count` occurrences.
     """
     rng = random.Random(seed)
     normal_recs = [r for r in records if not r["findings"]]
@@ -647,12 +889,16 @@ def balance_records_against_normal_bias(
 
     by_class: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for rec in abnormal_recs:
+        seen_in_rec = set()
         for f_item in rec["findings"]:
-            by_class[f_item["label"]].append(rec)
+            lbl = f_item["label"]
+            if lbl not in seen_in_rec:
+                by_class[lbl].append(rec)
+                seen_in_rec.add(lbl)
 
     balanced = list(abnormal_recs)
     for canon, class_recs in by_class.items():
-        if len(class_recs) < min_class_count and len(class_recs) > 0:
+        if 0 < len(class_recs) < min_class_count:
             needed = min_class_count - len(class_recs)
             balanced.extend(rng.choices(class_recs, k=needed))
 
@@ -665,36 +911,135 @@ def balance_records_against_normal_bias(
     return combined
 
 
+def _build_cad_prompt(cad_summary: str) -> str:
+    """Shared CAD prompt template used identically in Mode 2 (confirm) and Mode 3 (reject)."""
+    return (
+        f"Candidate Ensemble CAD findings: {cad_summary}.\n"
+        "Authenticate these CAD alerts against the radiograph and analyze this chest X-ray "
+        "step-by-step according to the 5-Rule Clinical Rulebook."
+    )
+
+
+def _build_mode3_rejection_payload(
+    record: dict[str, Any],
+    rng: random.Random,
+) -> tuple[str, list[str], str]:
+    """
+    Constructs a perturbed CAD alert + visual counter-evidence refutation notes.
+    Returns: (cad_summary, rejected_notes, rejection_subtype)
+      - normal_fp: Normal study + 1-2 fake CAD flags -> reject & conclude Normal.
+      - laterality_flip: Unilateral study + opposite-side CAD flag -> reject wrong side & correct.
+      - abnormal_distractor: Abnormal study + true flag(s) + 1 fake CAD flag -> confirm true, reject fake.
+    """
+    true_findings = record["findings"]
+    present_labels = {f["label"] for f in true_findings}
+    absent_pool = [c for c in _DISTRACTOR_POOL if c not in present_labels] or ["Pneumothorax"]
+
+    # Subtype 3a: Normal False-Positive Rejection
+    if not true_findings:
+        k = 2 if (len(absent_pool) >= 2 and rng.random() < 0.25) else 1
+        fake_classes = rng.sample(absent_pool, k=k)
+        cad_items: list[str] = []
+        ref_notes: list[str] = []
+        for fc in fake_classes:
+            meta = PATHOLOGY_ONTOLOGY[fc]
+            fake_zone = rng.choice(_DISTRACTOR_ZONES.get(fc, [meta["default_zone"]]))
+            cad_items.append(f"{meta['clinical_name']} at {fake_zone}")
+            ref_notes.append(
+                f"CAD flagged suspected {meta['clinical_name']} at the {fake_zone}; "
+                f"however, direct visual evaluation of the radiograph does not substantiate this alert, "
+                f"demonstrating {meta['neg_visual']}."
+            )
+        return "; ".join(cad_items), ref_notes, "normal_fp"
+
+    # Subtype 3c: Laterality Flip Rejection (when a unilateral finding is present)
+    flippable = [(i, f, _flip_laterality(f["zone"])) for i, f in enumerate(true_findings)]
+    flippable = [(i, f, flipped) for i, f, flipped in flippable if flipped is not None]
+    if flippable and rng.random() < 0.35:
+        flip_idx, target_f, wrong_zone = rng.choice(flippable)
+        meta = PATHOLOGY_ONTOLOGY[target_f["label"]]
+        cad_items = []
+        for i, f in enumerate(true_findings[:4]):
+            f_meta = PATHOLOGY_ONTOLOGY[f["label"]]
+            z = wrong_zone if i == flip_idx else f["zone"]
+            cad_items.append(f"{f_meta['clinical_name']} at {z}")
+        ref_note = (
+            f"CAD flagged suspected {meta['clinical_name']} at the {wrong_zone}; "
+            f"however, direct visual inspection rejects this laterality and confirms the abnormality "
+            f"is actually located within the {target_f['zone']}."
+        )
+        return "; ".join(cad_items), [ref_note], "laterality_flip"
+
+    # Subtype 3b: Abnormal Distractor Rejection (true finding + injected fake finding)
+    fake_cls = rng.choice(absent_pool)
+    fake_meta = PATHOLOGY_ONTOLOGY[fake_cls]
+    fake_zone = rng.choice(_DISTRACTOR_ZONES.get(fake_cls, [fake_meta["default_zone"]]))
+
+    cad_items = [
+        f"{PATHOLOGY_ONTOLOGY[f['label']]['clinical_name']} at {f['zone']}"
+        for f in true_findings[:3]
+    ]
+    cad_items.append(f"{fake_meta['clinical_name']} at {fake_zone}")
+    rng.shuffle(cad_items)
+
+    ref_note = (
+        f"CAD additionally flagged suspected {fake_meta['clinical_name']} at the {fake_zone}; "
+        f"however, direct visual evaluation rejects this false alert, showing {fake_meta['neg_visual']}."
+    )
+    return "; ".join(cad_items), [ref_note], "abnormal_distractor"
+
+
 def format_vlm_chat_sample(
     record: dict[str, Any],
     include_cad_context: bool = False,
+    mode: str | None = None,
+    rng: random.Random | None = None,
 ) -> dict[str, Any]:
-    """Formats a record into SmolVLM chat messages + validates 5-Rule compliance."""
-    target_report = build_rulebook_target(record["findings"], raw_report_note=record.get("note"))
-    ok, errs = validate_rulebook_compliance(target_report)
-    if not ok:
-        raise ValueError(f"Generated target failed rulebook validation: {errs}")
+    """
+    Formats a record into SmolVLM chat messages + validates 5-Rule compliance.
+    Backward-compatible with `include_cad_context=bool`; pass `mode="pure" | "cad_aligned" | "cad_reject"`
+    for full 3-Mode Rulebook + Authenticator synthesis.
+    """
+    effective_mode = mode or ("cad_aligned" if include_cad_context else "pure")
+    local_rng = rng or random.Random(42)
 
-    if include_cad_context:
+    rejected_notes: list[str] | None = None
+    rejection_subtype: str | None = None
+
+    if effective_mode == "pure":
+        user_text = "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
+    elif effective_mode == "cad_aligned":
         if not record["findings"]:
-            cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold."
+            cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold"
         else:
             cad_summary = "; ".join(
                 f"{PATHOLOGY_ONTOLOGY[f['label']]['clinical_name']} at {f['zone']}"
                 for f in record["findings"][:4]
             )
-        user_text = (
-            f"Verified Ensemble CAD findings: {cad_summary}.\n"
-            "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
-        )
+        user_text = _build_cad_prompt(cad_summary)
+    elif effective_mode == "cad_reject":
+        cad_summary, rejected_notes, rejection_subtype = _build_mode3_rejection_payload(record, local_rng)
+        user_text = _build_cad_prompt(cad_summary)
     else:
-        user_text = "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
+        raise ValueError(f"Unsupported mode: {effective_mode}")
+
+    target_report = build_rulebook_target(
+        record["findings"],
+        raw_report_note=record.get("note"),
+        rejected_cad_notes=rejected_notes,
+    )
+    ok, errs = validate_rulebook_compliance(target_report)
+    if not ok:
+        raise ValueError(f"Generated target failed rulebook validation: {errs}")
 
     return {
         "source": record.get("source", "unknown"),
+        "group_id": record.get("group_id", ""),
         "image_path": record["image_path"],
         "labels": [f["label"] for f in record["findings"]],
-        "cad_conditioned": include_cad_context,
+        "mode": effective_mode,
+        "rejection_subtype": rejection_subtype,
+        "cad_conditioned": effective_mode != "pure",
         "messages": [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK}]},
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]},
@@ -703,21 +1048,85 @@ def format_vlm_chat_sample(
     }
 
 
+def _emit_three_mode_samples(
+    records: list[dict[str, Any]],
+    seed: int = 42,
+    pure_ratio: float = 0.40,
+    cad_aligned_ratio: float = 0.35,
+) -> list[dict[str, Any]]:
+    """
+    Assigns 40% Pure-Image, 35% CAD-Aligned, and 25% CAD-Authenticator Rejection
+    while ensuring every study is represented cleanly.
+    """
+    rng = random.Random(seed)
+    samples: list[dict[str, Any]] = []
+    for rec in records:
+        r = rng.random()
+        if r < pure_ratio:
+            mode = "pure"
+        elif r < pure_ratio + cad_aligned_ratio:
+            mode = "cad_aligned"
+        else:
+            mode = "cad_reject"
+        samples.append(format_vlm_chat_sample(rec, mode=mode, rng=rng))
+    rng.shuffle(samples)
+    return samples
+
+
+def export_holdout_benchmarks(holdout_dir: str, img_cache_dir: str, image_size: int = 512, max_padchest: int = 250) -> None:
+    """Exports completely unseen ChestX-Det (test) and PadChest-GR (test) manifest for Gate 1-4 validation."""
+    out = Path(holdout_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    holdout_records: list[dict[str, Any]] = []
+    holdout_records.extend(
+        load_chestx_det_hf(split="test", img_cache_dir=img_cache_dir, image_size=image_size, streaming=True)
+    )
+    try:
+        holdout_records.extend(
+            load_padchest_gr_hf(
+                max_samples=max_padchest,
+                split="test",
+                img_cache_dir=img_cache_dir,
+                image_size=image_size,
+                streaming=True,
+            )
+        )
+    except Exception as exc:
+        print(f"[Holdout] Skipping PadChest-GR test split ({exc})")
+
+    manifest_path = out / "holdout_manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as mf:
+        json.dump(holdout_records, mf, indent=2)
+    print(f"[Holdout] Exported {len(holdout_records)} unseen test studies -> {manifest_path}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build balanced 5-Rule CoT training JSONL for SmolVLM.")
+    parser = argparse.ArgumentParser(description="Build balanced 3-Mode 5-Rule CoT training JSONL for SmolVLM.")
     parser.add_argument("--chestx-det", action="store_true", help="Include HuggingFace natealberti/ChestX-Det.")
     parser.add_argument("--chexpert-hf", action="store_true", help="Include HuggingFace danjacobellis/chexpert.")
     parser.add_argument("--padchest-gr", action="store_true", help="Include HuggingFace JasonZZ0601/PadChest-GR-Xray.")
+    parser.add_argument("--siim-pneumo", action="store_true", help="Include HuggingFace nwirandx/siim-pneumothorax-256-2400.")
     parser.add_argument("--max-per-source", type=int, default=None, help="Cap samples per dataset source.")
     parser.add_argument("--vindr-csv", type=str, default=None, help="Path to VinDr-CXR train.csv.")
     parser.add_argument("--vindr-images", type=str, default=None, help="Path to VinDr-CXR images folder.")
     parser.add_argument("--custom-jsonl", type=str, default=None, help="Path to custom JSONL manifest.")
-    parser.add_argument("--max-normal-ratio", type=float, default=0.22, help="Max fraction of Normal studies.")
-    parser.add_argument("--min-class-count", type=int, default=200, help="Oversample target per etiology.")
-    parser.add_argument("--val-ratio", type=float, default=0.10, help="Validation split fraction.")
-    parser.add_argument("--out-dir", type=str, default="./.tmp/rulebook_dataset", help="Output directory.")
-    parser.add_argument("--smoke-sample", action="store_true", help="Generate a tiny 2-sample demo dataset from local image.")
+    parser.add_argument("--max-normal-ratio", type=float, default=0.20, help="Max fraction of Normal studies.")
+    parser.add_argument("--min-class-count", type=int, default=300, help="Oversample target per etiology.")
+    parser.add_argument("--val-ratio", type=float, default=0.10, help="Validation split fraction (leak-free).")
+    parser.add_argument("--image-size", type=int, default=512, help="Cached RGB JPEG size.")
+    parser.add_argument("--img-cache-dir", type=str, default="./.tmp/training_images", help="Image cache folder (use /kaggle/tmp on Kaggle).")
+    parser.add_argument("--out-dir", type=str, default="./.tmp/rulebook_dataset", help="Output JSONL directory.")
+    parser.add_argument("--export-holdout-dir", type=str, default=None, help="Optionally export unseen ChestX-Det/PadChest-GR test holdout.")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--smoke-sample", action="store_true", help="Generate a tiny demo dataset from local image.")
     args = parser.parse_args()
+
+    if args.export_holdout_dir:
+        export_holdout_benchmarks(
+            holdout_dir=args.export_holdout_dir,
+            img_cache_dir=args.img_cache_dir,
+            image_size=args.image_size,
+        )
 
     records: list[dict[str, Any]] = []
     if args.smoke_sample:
@@ -725,50 +1134,77 @@ def main() -> None:
         if not os.path.exists(sample_img):
             raise FileNotFoundError(f"Smoke test image missing: {sample_img}")
         records = [
-            {"source": "smoke_normal", "image_path": sample_img, "findings": []},
-            {"source": "smoke_aortic", "image_path": sample_img, "findings": [
+            {"source": "smoke_normal", "group_id": "smoke_1", "image_path": sample_img, "findings": []},
+            {"source": "smoke_aortic", "group_id": "smoke_2", "image_path": sample_img, "findings": [
                 {"label": "Aortic Enlargement", "zone": "superior mediastinum / left aortic arch"}
+            ]},
+            {"source": "smoke_ptx", "group_id": "smoke_3", "image_path": sample_img, "findings": [
+                {"label": "Pneumothorax", "zone": "right apical pleural space"}
             ]},
         ]
     else:
         if args.chestx_det:
-            records.extend(load_chestx_det_hf(max_samples=args.max_per_source))
+            records.extend(load_chestx_det_hf(
+                max_samples=args.max_per_source,
+                img_cache_dir=args.img_cache_dir,
+                image_size=args.image_size,
+            ))
         if args.chexpert_hf:
-            records.extend(load_chexpert_hf(max_samples=args.max_per_source))
+            records.extend(load_chexpert_hf(
+                max_samples=args.max_per_source,
+                img_cache_dir=args.img_cache_dir,
+                image_size=args.image_size,
+            ))
         if args.padchest_gr:
-            records.extend(load_padchest_gr_hf(max_samples=args.max_per_source))
+            records.extend(load_padchest_gr_hf(
+                max_samples=args.max_per_source,
+                img_cache_dir=args.img_cache_dir,
+                image_size=args.image_size,
+            ))
+        if args.siim_pneumo:
+            records.extend(load_siim_pneumo_hf(
+                max_samples=args.max_per_source,
+                img_cache_dir=args.img_cache_dir,
+                image_size=args.image_size,
+            ))
         if args.vindr_csv and args.vindr_images:
             records.extend(load_vindr_csv(args.vindr_csv, args.vindr_images, max_samples=args.max_per_source))
         if args.custom_jsonl:
             records.extend(load_generic_jsonl(args.custom_jsonl))
 
     if not records:
-        print("No dataset inputs provided. Pass --chestx-det, --vindr-csv, --custom-jsonl, or --smoke-sample.")
+        print("No dataset inputs provided. Pass --chestx-det, --padchest-gr, --chexpert-hf, --siim-pneumo, or --smoke-sample.")
         return
 
-    if not args.smoke_sample:
-        records = balance_records_against_normal_bias(
-            records,
+    # 1. Leak-free group split BEFORE oversampling
+    if args.smoke_sample:
+        train_recs = records
+        val_recs = records[:2]
+    else:
+        train_recs, val_recs = split_records_by_group(records, val_ratio=args.val_ratio, seed=args.seed)
+        train_recs = balance_records_against_normal_bias(
+            train_recs,
             max_normal_ratio=args.max_normal_ratio,
             min_class_count=args.min_class_count,
+            seed=args.seed,
         )
 
-    # Emit BOTH Pure-Image CoT and CAD-Grounded CoT examples for every study
-    chat_samples: list[dict[str, Any]] = []
-    class_counts: Counter[str] = Counter()
-    for rec in records:
-        if not rec["findings"]:
-            class_counts["Normal"] += 1
-        else:
-            for f_item in rec["findings"]:
-                class_counts[f_item["label"]] += 1
-        chat_samples.append(format_vlm_chat_sample(rec, include_cad_context=False))
-        chat_samples.append(format_vlm_chat_sample(rec, include_cad_context=True))
-
-    random.Random(42).shuffle(chat_samples)
-    val_count = max(1, int(len(chat_samples) * args.val_ratio))
-    val_samples = chat_samples[:val_count]
-    train_samples = chat_samples[val_count:] if len(chat_samples) > val_count else chat_samples
+    # 2. Emit 3-Mode training mix (40% Pure / 35% CAD-Aligned / 25% CAD-Rejection)
+    if args.smoke_sample:
+        rng = random.Random(args.seed)
+        train_samples = [
+            format_vlm_chat_sample(train_recs[0], mode="pure", rng=rng),
+            format_vlm_chat_sample(train_recs[1], mode="cad_aligned", rng=rng),
+            format_vlm_chat_sample(train_recs[0], mode="cad_reject", rng=rng),
+            format_vlm_chat_sample(train_recs[2], mode="cad_reject", rng=rng),
+        ]
+        val_samples = [
+            format_vlm_chat_sample(val_recs[0], mode="pure", rng=rng),
+            format_vlm_chat_sample(val_recs[1], mode="cad_reject", rng=rng),
+        ]
+    else:
+        train_samples = _emit_three_mode_samples(train_recs, seed=args.seed, pure_ratio=0.40, cad_aligned_ratio=0.35)
+        val_samples = _emit_three_mode_samples(val_recs, seed=args.seed + 1, pure_ratio=0.40, cad_aligned_ratio=0.35)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -777,8 +1213,24 @@ def main() -> None:
             for sample in subset:
                 f.write(json.dumps(sample) + "\n")
 
-    print(f"[Dataset Builder] Wrote {len(train_samples)} train and {len(val_samples)} val samples to {out_dir}")
-    print("[Dataset Builder] Class distribution:", dict(class_counts.most_common()))
+    class_counts: Counter[str] = Counter()
+    mode_counts: Counter[str] = Counter()
+    rej_counts: Counter[str] = Counter()
+    for s in train_samples:
+        mode_counts[s["mode"]] += 1
+        if s.get("rejection_subtype"):
+            rej_counts[s["rejection_subtype"]] += 1
+        if not s["labels"]:
+            class_counts["Normal"] += 1
+        else:
+            for lbl in s["labels"]:
+                class_counts[lbl] += 1
+
+    total_train = max(1, len(train_samples))
+    normal_pct = 100.0 * class_counts["Normal"] / total_train
+    print(f"[Dataset Builder] Wrote {len(train_samples)} train and {len(val_samples)} unseen val samples -> {out_dir}")
+    print(f"[Dataset Builder] Mode split: {dict(mode_counts)} | Rejection subtypes: {dict(rej_counts)}")
+    print(f"[Dataset Builder] Normal-only share: {normal_pct:.1f}% | Top classes: {dict(class_counts.most_common(15))}")
 
 
 if __name__ == "__main__":

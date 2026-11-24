@@ -345,13 +345,14 @@ class ChestXRayPipeline:
         self.llm_model.eval()
         print("[VLM Engine] SmolVLM ready.")
 
-    def _generate_vlm_text(
+ def _generate_vlm_text(
         self,
         image: Image.Image,
         user_prompt: str,
-        max_new_tokens: int = 200,
+        max_new_tokens: int = 384,
     ) -> str:
-        image_rgb = image.convert("RGB").resize((512, 512))
+        resample = getattr(Image, "Resampling", Image).BILINEAR
+        image_rgb = image.convert("RGB").resize((512, 512), resample)
         if self.is_rulebook_v2 or not self.use_lora:
             messages = [
                 {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK}]},
@@ -380,12 +381,13 @@ class ChestXRayPipeline:
         }
 
         input_len = inputs["input_ids"].shape[1]
+        rep_penalty = 1.08 if self.is_rulebook_v2 else 1.15
         with torch.no_grad():
             output_ids = self.llm_model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                repetition_penalty=1.15,
+                repetition_penalty=rep_penalty,
             )
         decoded = self.processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
 
@@ -393,6 +395,8 @@ class ChestXRayPipeline:
         gc.collect()
         if self.llm_device == "mps":
             torch.mps.empty_cache()
+        elif self.llm_device == "cuda":
+            torch.cuda.empty_cache()
         return decoded
 
     def analyze(
@@ -420,7 +424,7 @@ class ChestXRayPipeline:
             raw_report = self._generate_vlm_text(
                 image,
                 "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook.",
-                max_new_tokens=250,
+                max_new_tokens=384 if self.is_rulebook_v2 else 250,
             )
             return {
                 "report": raw_report,
@@ -450,20 +454,33 @@ class ChestXRayPipeline:
 
         raw_vlm_text = ""
         if use_vlm:
-            if not cad_findings:
-                cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold."
-            else:
-                cad_summary = "; ".join(
-                    f"{d['clinical_name']} at {d['location']} (Calibrated: {d['cal_prob']:.0%})"
-                    for d in cad_findings
+            if self.is_rulebook_v2:
+                if not cad_findings:
+                    cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold"
+                else:
+                    cad_summary = "; ".join(
+                        f"{d['clinical_name']} at {d['location']}"
+                        for d in cad_findings[:4]
+                    )
+                user_prompt = (
+                    f"Candidate Ensemble CAD findings: {cad_summary}.\n"
+                    "Authenticate these CAD alerts against the radiograph and analyze this chest X-ray "
+                    "step-by-step according to the 5-Rule Clinical Rulebook."
                 )
-            user_prompt = (
-                f"Verified Ensemble CAD findings: {cad_summary}.\n"
-                "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
-            )
-            raw_vlm_text = self._generate_vlm_text(image, user_prompt, max_new_tokens=160)
-
-        total_models = len(self.ensemble_224) + (1 if self.resnet_512 is not None else 0)
+                raw_vlm_text = self._generate_vlm_text(image, user_prompt, max_new_tokens=384)
+            else:
+                if not cad_findings:
+                    cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold."
+                else:
+                    cad_summary = "; ".join(
+                        f"{d['clinical_name']} at {d['location']} (Calibrated: {d['cal_prob']:.0%})"
+                        for d in cad_findings
+                    )
+                user_prompt = (
+                    f"Verified Ensemble CAD findings: {cad_summary}\n"
+                    "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
+                )
+                raw_vlm_text = self._generate_vlm_text(image, user_prompt, max_new_tokens=160)        total_models = len(self.ensemble_224) + (1 if self.resnet_512 is not None else 0)
         final_report = synthesize_audited_rulebook_report(
             raw_vlm_text,
             cad_findings,
