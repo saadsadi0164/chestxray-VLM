@@ -531,16 +531,56 @@ CHESTX_DET_ID2LABEL: dict[int, str] = {
 
 
 def _save_resized_image(pil_img: Any, out_path: Path, image_size: int = 512) -> str:
-    """Saves a compact 512x512 RGB JPEG (~40 KB) so Kaggle disk never overflows."""
+    """Saves a compact 512x512 RGB JPEG (~40 KB), safely normalizing 12/16-bit medical images."""
+    import numpy as np
     from PIL import Image
 
     if not out_path.exists():
+        arr = np.asarray(pil_img)
+        if arr.dtype != np.uint8 or str(getattr(pil_img, "mode", "")).startswith(("I", "F")):
+            arr_f = arr.astype(np.float32)
+            if arr_f.ndim == 3:
+                arr_f = arr_f[..., 0]
+            p1, p99 = np.percentile(arr_f, [1.0, 99.0])
+            if p99 > p1:
+                arr_f = np.clip((arr_f - p1) / (p99 - p1), 0.0, 1.0) * 255.0
+            elif float(arr_f.max()) > float(arr_f.min()):
+                arr_f = (arr_f - float(arr_f.min())) / (float(arr_f.max()) - float(arr_f.min())) * 255.0
+            else:
+                arr_f = np.zeros_like(arr_f)
+            rgb = Image.fromarray(arr_f.astype(np.uint8)).convert("RGB")
+        else:
+            rgb = pil_img.convert("RGB")
         resample = getattr(Image, "Resampling", Image).BILINEAR
-        rgb = pil_img.convert("RGB")
         if rgb.size != (image_size, image_size):
             rgb = rgb.resize((image_size, image_size), resample)
         rgb.save(out_path, format="JPEG", quality=95)
     return str(out_path)
+
+
+def _parse_padchest_locations(locs: Any) -> str:
+    """Safely parses PadChest-GR locations whether stored as a list or stringified list."""
+    import ast
+
+    if isinstance(locs, str):
+        s_loc = locs.strip()
+        if s_loc.startswith("["):
+            try:
+                locs = ast.literal_eval(s_loc)
+            except Exception:
+                locs = []
+        else:
+            locs = [s_loc] if s_loc else []
+    elif not isinstance(locs, list):
+        locs = []
+
+    flat: list[str] = []
+    for x in locs:
+        if isinstance(x, (list, tuple)):
+            flat.extend(str(y).strip() for y in x if str(y).strip())
+        elif str(x).strip():
+            flat.append(str(x).strip())
+    return ", ".join(dict.fromkeys(flat))
 
 
 def load_chestx_det_hf(
@@ -550,14 +590,10 @@ def load_chestx_det_hf(
     split: str = "train",
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
-    """
-    Streams `natealberti/ChestX-Det` from HuggingFace (13 thoracic classes).
-    Extracts exact class IDs and bounding boxes directly from the `label` pixel mask
-    (`255` = Background, `1..13` = ChestX-Det pathology categories).
-    """
     import numpy as np
     from datasets import load_dataset
 
+    print(f"[Loader] Streaming ChestX-Det ({split})...", flush=True)
     ds = load_dataset("natealberti/ChestX-Det", split=split, streaming=streaming)
     records: list[dict[str, Any]] = []
     out_img_dir = Path(img_cache_dir) / f"chestx_det_{split}"
@@ -598,7 +634,9 @@ def load_chestx_det_hf(
             "image_path": img_file,
             "findings": findings,
         })
-    print(f"[Loader] ChestX-Det ({split}): loaded {len(records)} studies")
+        if len(records) % 250 == 0:
+            print(f"  [ChestX-Det-{split}] {len(records)} cached...", flush=True)
+    print(f"[Loader] ChestX-Det ({split}): loaded {len(records)} studies", flush=True)
     return records
 
 
@@ -609,9 +647,10 @@ def load_chexpert_hf(
     image_size: int = 512,
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
-    """Streams `danjacobellis/chexpert` from HuggingFace (Frontal == 0, positive == 3)."""
+    """Streams danjacobellis/chexpert (Frontal == 0, positive == 3; skips ambiguous uncertain-only rows)."""
     from datasets import load_dataset
 
+    print("[Loader] Streaming CheXpert (train, frontal only)...", flush=True)
     ds = load_dataset("danjacobellis/chexpert", split="train", streaming=streaming)
     chex_cols = [
         "Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion",
@@ -632,8 +671,8 @@ def load_chexpert_hf(
         if pil_img is None:
             continue
 
-        img_file = _save_resized_image(pil_img, out_img_dir / f"chexpert_{idx:06d}.jpg", image_size)
         findings = []
+        has_uncertain = False
         for col in chex_cols:
             val = row.get(col)
             if val == 3 or str(val).strip() == "3":
@@ -643,7 +682,14 @@ def load_chexpert_hf(
                         "label": canon,
                         "zone": PATHOLOGY_ONTOLOGY[canon]["default_zone"],
                     })
+            elif val == 2 or str(val).strip() == "2":
+                has_uncertain = True
 
+        no_finding = row.get("No Finding") == 3 or str(row.get("No Finding")).strip() == "3"
+        if not findings and (not no_finding or has_uncertain):
+            continue
+
+        img_file = _save_resized_image(pil_img, out_img_dir / f"chexpert_{idx:06d}.jpg", image_size)
         raw_path = str(row.get("Path") or row.get("path") or "")
         pat_match = re.search(r"patient\d+", raw_path, flags=re.IGNORECASE)
         group_id = f"chexpert_{pat_match.group(0).lower()}" if pat_match else f"chexpert_{idx:06d}"
@@ -654,7 +700,9 @@ def load_chexpert_hf(
             "image_path": img_file,
             "findings": findings,
         })
-    print(f"[Loader] CheXpert (train): loaded {len(records)} frontal studies")
+        if len(records) % 500 == 0:
+            print(f"  [CheXpert] {len(records)} cached...", flush=True)
+    print(f"[Loader] CheXpert (train): loaded {len(records)} frontal studies", flush=True)
     return records
 
 
@@ -665,9 +713,10 @@ def load_padchest_gr_hf(
     split: str = "train",
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
-    """Streams `JasonZZ0601/PadChest-GR-Xray` without downloading the full 75 GB archive."""
+    """Streams JasonZZ0601/PadChest-GR-Xray with 16-bit contrast normalization & safe location parsing."""
     from datasets import load_dataset
 
+    print(f"[Loader] Streaming PadChest-GR ({split}, 16-bit normalized)...", flush=True)
     ds = load_dataset("JasonZZ0601/PadChest-GR-Xray", split=split, streaming=streaming)
     out_img_dir = Path(img_cache_dir) / f"padchest_gr_{split}"
     out_img_dir.mkdir(parents=True, exist_ok=True)
@@ -683,13 +732,9 @@ def load_padchest_gr_hf(
         img_file = _save_resized_image(pil_img, out_img_dir / f"padchest_{split}_{idx:06d}.jpg", image_size)
 
         raw_lbl = row.get("label") if row.get("label") is not None else row.get("labels", "")
-        if isinstance(raw_lbl, list):
-            parts = [str(x) for x in raw_lbl]
-        else:
-            parts = [p for p in str(raw_lbl).split(",")]
+        parts = [str(x) for x in raw_lbl] if isinstance(raw_lbl, list) else [p for p in str(raw_lbl).split(",")]
+        loc_str = _parse_padchest_locations(row.get("locations"))
 
-        locs = row.get("locations") or []
-        loc_str = " ".join(str(x) for x in locs if x) if isinstance(locs, list) else str(locs or "")
         boxes = row.get("boxes") or row.get("bbox") or None
         first_box = None
         if isinstance(boxes, list) and boxes:
@@ -705,7 +750,7 @@ def load_padchest_gr_hf(
                 if first_box is not None:
                     zone = bbox_to_anatomical_zone(first_box, canon, img_w=img_w, img_h=img_h)
                 else:
-                    zone = loc_str.strip() or PATHOLOGY_ONTOLOGY[canon]["default_zone"]
+                    zone = loc_str or PATHOLOGY_ONTOLOGY[canon]["default_zone"]
                 findings.append({"label": canon, "zone": zone})
 
         note = str(row.get("sentence_en") or "").strip()
@@ -718,7 +763,9 @@ def load_padchest_gr_hf(
             "findings": findings,
             "note": None if (not note or note.lower() == "none") else note,
         })
-    print(f"[Loader] PadChest-GR ({split}): loaded {len(records)} studies")
+        if len(records) % 100 == 0:
+            print(f"  [PadChest-GR-{split}] {len(records)} cached...", flush=True)
+    print(f"[Loader] PadChest-GR ({split}): loaded {len(records)} studies", flush=True)
     return records
 
 
@@ -728,10 +775,11 @@ def load_siim_pneumo_hf(
     image_size: int = 512,
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
-    """Streams `nwirandx/siim-pneumothorax-256-2400` for high-recall Pneumothorax bbox grounding."""
+    """Streams nwirandx/siim-pneumothorax-256-2400 for high-recall Pneumothorax bbox grounding."""
     import numpy as np
     from datasets import load_dataset
 
+    print("[Loader] Streaming SIIM-Pneumothorax (train)...", flush=True)
     ds = load_dataset("nwirandx/siim-pneumothorax-256-2400", split="train", streaming=streaming)
     out_img_dir = Path(img_cache_dir) / "siim_pneumo"
     out_img_dir.mkdir(parents=True, exist_ok=True)
@@ -769,7 +817,9 @@ def load_siim_pneumo_hf(
             "image_path": img_file,
             "findings": findings,
         })
-    print(f"[Loader] SIIM-Pneumothorax: loaded {len(records)} studies")
+        if len(records) % 500 == 0:
+            print(f"  [SIIM-Pneumothorax] {len(records)} cached...", flush=True)
+    print(f"[Loader] SIIM-Pneumothorax: loaded {len(records)} studies", flush=True)
     return records
 
 
@@ -1073,7 +1123,7 @@ def _emit_three_mode_samples(
     return samples
 
 
-def export_holdout_benchmarks(holdout_dir: str, img_cache_dir: str, image_size: int = 512, max_padchest: int = 250) -> None:
+def export_holdout_benchmarks(holdout_dir: str, img_cache_dir: str, image_size: int = 512, max_padchest: int = 120) -> None:
     """Exports completely unseen ChestX-Det (test) and PadChest-GR (test) manifest for Gate 1-4 validation."""
     out = Path(holdout_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1157,7 @@ def main() -> None:
     parser.add_argument("--padchest-gr", action="store_true", help="Include HuggingFace JasonZZ0601/PadChest-GR-Xray.")
     parser.add_argument("--siim-pneumo", action="store_true", help="Include HuggingFace nwirandx/siim-pneumothorax-256-2400.")
     parser.add_argument("--max-per-source", type=int, default=None, help="Cap samples per dataset source.")
+    parser.add_argument("--max-padchest", type=int, default=None, help="Optional separate cap for heavy 16-bit PadChest-GR.")
     parser.add_argument("--vindr-csv", type=str, default=None, help="Path to VinDr-CXR train.csv.")
     parser.add_argument("--vindr-images", type=str, default=None, help="Path to VinDr-CXR images folder.")
     parser.add_argument("--custom-jsonl", type=str, default=None, help="Path to custom JSONL manifest.")
@@ -1157,7 +1208,7 @@ def main() -> None:
             ))
         if args.padchest_gr:
             records.extend(load_padchest_gr_hf(
-                max_samples=args.max_per_source,
+                max_samples=args.max_padchest or args.max_per_source,
                 img_cache_dir=args.img_cache_dir,
                 image_size=args.image_size,
             ))
