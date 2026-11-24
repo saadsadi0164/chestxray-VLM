@@ -70,6 +70,11 @@ class TestAntiHallucinationGuardrail(unittest.TestCase):
         kept = filter_unverified_vlm_sentences(vlm, allowed_raw_labels=set())
         self.assertEqual(kept, ["The trachea is midline"])
 
+    def test_blocks_vlm_negating_cad_verified_pathology(self):
+        vlm = "The right lung is clear without evidence of pleural effusions."
+        kept = filter_unverified_vlm_sentences(vlm, allowed_raw_labels={"Effusion"})
+        self.assertEqual(kept, [], "VLM must not contradict Stage 1 CAD's verified Effusion")
+
     def test_synthesized_report_obeys_5_rule_compliance(self):
         cad = [{
             "raw_label": "Pneumothorax",

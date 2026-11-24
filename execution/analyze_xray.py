@@ -81,7 +81,8 @@ _NEGATION_RE = re.compile(
 )
 _NORMAL_BIAS_CLAIM_RE = re.compile(
     r"\b(?:no acute cardiopulmonary|no acute disease|no acute abnormality|"
-    r"lungs are clear|clear bilaterally|normal chest radiograph|unremarkable chest)\b",
+    r"lungs are clear|lung zones are clear|clear bilaterally|clear without|"
+    r"normal chest radiograph|unremarkable chest)\b",
     flags=re.IGNORECASE,
 )
 _PROMPT_ECHO_RE = re.compile(
@@ -153,10 +154,17 @@ def filter_unverified_vlm_sentences(
             continue
 
         hallucinated = False
+        contradicts_cad = False
         for clause in _CLAUSE_SPLIT_RE.split(s_clean.lower()):
             clause = clause.strip()
             if not clause:
                 continue
+            neg_match = _NEGATION_RE.search(clause)
+            if neg_match and allowed_raw_labels:
+                negated_part = clause[neg_match.start():]
+                if any(st in negated_part for st in allowed_stems):
+                    contradicts_cad = True
+                    break
             unnegated = _NEGATION_RE.sub(" ", clause)
             for _, stems in ALL_PATHOLOGY_STEMS.items():
                 if any(st in unnegated for st in stems) and not any(st in allowed_stems for st in stems):
@@ -165,7 +173,7 @@ def filter_unverified_vlm_sentences(
             if hallucinated:
                 break
 
-        if not hallucinated:
+        if not hallucinated and not contradicts_cad:
             kept.append(s_clean.rstrip("."))
 
     return kept[:2]

@@ -12,9 +12,11 @@ Train `HuggingFaceTB/SmolVLM-500M-Instruct` across diverse multi-institutional c
 2. **Rulebook QLoRA/LoRA Trainer:** [`execution/train_rulebook_vlm.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/train_rulebook_vlm.py)
 
 ## Supported Datasets (25 Unified Thoracic Classes)
-- **ChestX-Det** (`--chestx-det`): 13 pathologies with physician polygons/bounding boxes.
-- **VinDr-CXR** (`--vindr-csv`, `--vindr-images`): 22 critical findings + bounding boxes.
-- **Custom / NIH / CheXpert / MIMIC-CXR / RSNA / OpenI** (`--custom-jsonl`): Normalized JSONL manifest with `image_path` and `findings: [{label, bbox, zone}]`.
+- **ChestX-Det** (`--chestx-det`): HuggingFace `natealberti/ChestX-Det` — 13 pathologies extracted from exact semantic masks (`id2label` 1..13, `255` = background) with pixel bounding boxes.
+- **PadChest-GR** (`--padchest-gr`): HuggingFace `JasonZZ0601/PadChest-GR-Xray` — grounded radiological findings, anatomical locations, and English sentences.
+- **CheXpert** (`--chexpert-hf`): HuggingFace `danjacobellis/chexpert` — frontal/AP/PA studies across 13 acute/device classes (`label == 3` positives).
+- **VinDr-CXR** (`--vindr-csv`, `--vindr-images`): 22 critical findings + physician bounding boxes.
+- **Custom / NIH / MIMIC-CXR / RSNA / OpenI** (`--custom-jsonl`): Normalized JSONL manifest with `image_path` and `findings: [{label, bbox, zone}]`.
 
 ## Standard Operating Workflow
 
@@ -23,6 +25,9 @@ Train `HuggingFaceTB/SmolVLM-500M-Instruct` across diverse multi-institutional c
 source .venv/bin/activate
 python execution/build_rulebook_dataset.py \
   --chestx-det \
+  --padchest-gr \
+  --chexpert-hf \
+  --max-per-source 3000 \
   --max-normal-ratio 0.22 \
   --min-class-count 250 \
   --out-dir ./.tmp/rulebook_dataset

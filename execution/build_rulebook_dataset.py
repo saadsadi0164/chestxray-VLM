@@ -418,8 +418,30 @@ def validate_rulebook_compliance(report: str) -> tuple[bool, list[str]]:
 # =====================================================================
 # 4. DATASET LOADERS & CLASS-BALANCED SAMPLING
 # =====================================================================
+CHESTX_DET_ID2LABEL: dict[int, str] = {
+    1: "Atelectasis",
+    2: "Calcification",
+    3: "Cardiomegaly",
+    4: "Consolidation",
+    5: "Diffuse Nodule",
+    6: "Effusion",
+    7: "Emphysema",
+    8: "Fibrosis",
+    9: "Fracture",
+    10: "Mass",
+    11: "Nodule",
+    12: "Pleural Thickening",
+    13: "Pneumothorax",
+}
+
+
 def load_chestx_det_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
-    """Loads `natealberti/ChestX-Det` from HuggingFace (13 thoracic classes + bounding boxes)."""
+    """
+    Loads `natealberti/ChestX-Det` from HuggingFace (13 thoracic classes).
+    Extracts exact class IDs and bounding boxes directly from the `label` pixel mask
+    (`255` = Background, `1..13` = ChestX-Det pathology categories).
+    """
+    import numpy as np
     from datasets import load_dataset  # Lazy import so inference runtime stays slim
 
     ds = load_dataset("natealberti/ChestX-Det", split="train")
@@ -431,6 +453,7 @@ def load_chestx_det_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
         if max_samples and idx >= max_samples:
             break
         pil_img = row.get("image")
+        lbl_img = row.get("label")
         if pil_img is None:
             continue
         img_w, img_h = pil_img.size
@@ -438,20 +461,104 @@ def load_chestx_det_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
         if not img_file.exists():
             pil_img.save(img_file)
 
-        syms = row.get("syms") or row.get("labels") or []
-        boxes = row.get("boxes") or [None] * len(syms)
-        findings = []
-        for lbl, box in zip(syms, boxes):
-            canon = canonicalize_label(str(lbl))
-            if canon:
+        findings: list[dict[str, Any]] = []
+        if lbl_img is not None:
+            lbl_arr = np.asarray(lbl_img)
+            for uid in np.unique(lbl_arr):
+                uid_int = int(uid)
+                if uid_int == 255 or uid_int not in CHESTX_DET_ID2LABEL:
+                    continue
+                canon = canonicalize_label(CHESTX_DET_ID2LABEL[uid_int])
+                if not canon:
+                    continue
+                ys, xs = np.where(lbl_arr == uid_int)
+                box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())] if len(xs) else None
                 findings.append({
                     "label": canon,
                     "zone": bbox_to_anatomical_zone(box, canon, img_w=img_w, img_h=img_h),
                 })
+
         records.append({
             "source": "ChestX-Det",
             "image_path": str(img_file),
             "findings": findings,
+        })
+    return records
+
+
+def load_chexpert_hf(max_samples: int | None = None, frontal_only: bool = True) -> list[dict[str, Any]]:
+    """Loads `danjacobellis/chexpert` from HuggingFace (positive label == 3)."""
+    from datasets import load_dataset
+
+    ds = load_dataset("danjacobellis/chexpert", split="train")
+    chex_cols = [
+        "Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion",
+        "Edema", "Consolidation", "Pneumonia", "Atelectasis", "Pneumothorax",
+        "Pleural Effusion", "Pleural Other", "Fracture", "Support Devices",
+    ]
+    out_img_dir = Path("./.tmp/training_images/chexpert")
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(ds):
+        if max_samples and len(records) >= max_samples:
+            break
+        if frontal_only and str(row.get("Frontal/Lateral")) != "0":
+            continue
+        pil_img = row.get("image")
+        if pil_img is None:
+            continue
+        img_file = out_img_dir / f"chexpert_{idx:06d}.png"
+        if not img_file.exists():
+            pil_img.save(img_file)
+        findings = []
+        for col in chex_cols:
+            if str(row.get(col)) == "3":
+                canon = canonicalize_label(col)
+                if canon:
+                    findings.append({
+                        "label": canon,
+                        "zone": PATHOLOGY_ONTOLOGY[canon]["default_zone"],
+                    })
+        records.append({"source": "CheXpert", "image_path": str(img_file), "findings": findings})
+    return records
+
+
+def load_padchest_gr_hf(max_samples: int | None = None) -> list[dict[str, Any]]:
+    """Loads `JasonZZ0601/PadChest-GR-Xray` (grounded findings, locations & sentences)."""
+    from datasets import load_dataset
+
+    ds = load_dataset("JasonZZ0601/PadChest-GR-Xray", split="train")
+    out_img_dir = Path("./.tmp/training_images/padchest_gr")
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(ds):
+        if max_samples and len(records) >= max_samples:
+            break
+        pil_img = row.get("image")
+        if pil_img is None:
+            continue
+        img_file = out_img_dir / f"padchest_{idx:06d}.png"
+        if not img_file.exists():
+            pil_img.save(img_file)
+        lbl = str(row.get("label", ""))
+        locs = row.get("locations") or []
+        loc_str = " ".join(str(x) for x in locs) if isinstance(locs, list) else str(locs)
+        findings = []
+        for part in lbl.split(","):
+            canon = canonicalize_label(part)
+            if canon:
+                findings.append({
+                    "label": canon,
+                    "zone": loc_str.strip() or PATHOLOGY_ONTOLOGY[canon]["default_zone"],
+                })
+        note = str(row.get("sentence_en") or "")
+        records.append({
+            "source": "PadChest-GR",
+            "image_path": str(img_file),
+            "findings": findings,
+            "note": None if note == "None" else note,
         })
     return records
 
@@ -599,6 +706,9 @@ def format_vlm_chat_sample(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build balanced 5-Rule CoT training JSONL for SmolVLM.")
     parser.add_argument("--chestx-det", action="store_true", help="Include HuggingFace natealberti/ChestX-Det.")
+    parser.add_argument("--chexpert-hf", action="store_true", help="Include HuggingFace danjacobellis/chexpert.")
+    parser.add_argument("--padchest-gr", action="store_true", help="Include HuggingFace JasonZZ0601/PadChest-GR-Xray.")
+    parser.add_argument("--max-per-source", type=int, default=None, help="Cap samples per dataset source.")
     parser.add_argument("--vindr-csv", type=str, default=None, help="Path to VinDr-CXR train.csv.")
     parser.add_argument("--vindr-images", type=str, default=None, help="Path to VinDr-CXR images folder.")
     parser.add_argument("--custom-jsonl", type=str, default=None, help="Path to custom JSONL manifest.")
@@ -622,9 +732,13 @@ def main() -> None:
         ]
     else:
         if args.chestx_det:
-            records.extend(load_chestx_det_hf())
+            records.extend(load_chestx_det_hf(max_samples=args.max_per_source))
+        if args.chexpert_hf:
+            records.extend(load_chexpert_hf(max_samples=args.max_per_source))
+        if args.padchest_gr:
+            records.extend(load_padchest_gr_hf(max_samples=args.max_per_source))
         if args.vindr_csv and args.vindr_images:
-            records.extend(load_vindr_csv(args.vindr_csv, args.vindr_images))
+            records.extend(load_vindr_csv(args.vindr_csv, args.vindr_images, max_samples=args.max_per_source))
         if args.custom_jsonl:
             records.extend(load_generic_jsonl(args.custom_jsonl))
 
