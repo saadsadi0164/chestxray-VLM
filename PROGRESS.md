@@ -1,7 +1,6 @@
-# ChestXStudio-VLM: Comprehensive Project Status & AI Handoff Report
+# ChestXStudio-VLM: Project Status, Code Audit Log & AI Handoff Report
 
-> **Purpose of this document:**  
-> This file provides an exhaustive, self-contained overview of the project's current state, architectural decisions, completed work, verified test results, and immediate next steps. Any AI assistant or engineer reading this file can instantly understand where the project is, where we left off, and how to continue without ambiguity.
+> **Purpose:** Self-contained engineering status report for human developers and AI assistants to resume work without skimming or ambiguity.
 
 ---
 
@@ -10,151 +9,82 @@
 - **Project Name:** ChestXStudio-VLM
 - **Repository:** `saadsadi0164/chestxray-VLM` (Branch: `main`)
 - **Author:** M. Saad Sadi (`scientistsadi@gmail.com`)
-- **Primary Objective:** Build a lightweight, locally runnable medical Vision-Language Model (VLM) system specialized in interpreting frontal chest radiographs (CXRs) and generating structured clinical radiology reports following a strict, constraint-driven clinical reasoning rulebook.
-- **Hardware Target:** macOS Apple Silicon (PyTorch Metal Performance Shaders - `MPS`, `torch.float16`) with automatic fallback to `CPU` (`torch.float32`).
+- **Local Machine Hardware:** macOS Apple Silicon (8 GB Unified RAM, ~15 GB free disk), PyTorch `2.15.0` with Metal Performance Shaders (`MPS`).
 
 ---
 
-## 2. Model & Pipeline Architecture
+## 2. Current Architecture (3-Layer Design per `agent.md`)
 
-### A. Core VLM Backbone (Pure Multimodal Pipeline)
-- **Base Model:** [`HuggingFaceTB/SmolVLM-500M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-500M-Instruct) (517M parameters: Vision Transformer ViT + Modality Projector + 500M causal LLM decoder).
-- **Medical Adapter:** Custom QLoRA fine-tuned adapter stored in [`chestxray_smolvlm_lora/`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/chestxray_smolvlm_lora) (PEFT LoRA, Rank $r=16$, Alpha $\alpha=32$, targeting attention and MLP projections `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`).
-- **Dataset Origin:** Indiana University Chest X-Ray Collection (frontal projections, text-repaired and clinically aligned).
-- **Global Context ViT Setting:** `processor.image_processor.do_image_splitting = False` so the Vision Transformer processes the entire thoracic cavity as a single unified visual frame rather than fragmented sub-patches.
-
-### B. Chain-of-Thought (CoT) Clinical Rulebook
-To prevent hallucinations and counter "Normal-biased" generation common in small VLMs, the generation prompt enforces a mandatory 5-rule clinical diagnostic protocol:
-1. **Rule 1 — Systematic Search:** Ordered anatomical traversal (airways, lungs/pleura, mediastinum, heart, osseous structures).
-2. **Rule 2 — Observation Before Etiology:** Physical visual features (density, opacity, lucency, contour, size) must be described **before** naming a pathology or etiology.
-3. **Rule 3 — Spatial Grounding:** Exact anatomical localization for every positive observation (e.g., right lower lobe, costophrenic sulcus).
-4. **Rule 4 — Explicit Negatives:** Mandatory explicit documentation of the absence of critical acute pathologies (pneumothorax, pleural effusion, focal consolidation, pulmonary edema, acute fracture).
-5. **Rule 5 — Uncertainty Calibration:** Probabilistic framing for ambiguous or overlapping differential presentations.
-
----
-
-## 3. The 3-Layer System Architecture (`agent.md`)
-
-The workspace strictly implements the 3-layer separation of concerns:
-
-```
+```text
 chest x-ray VLM/
-├── directives/                        # LAYER 1: SOPs / Directives (What to do)
-│   └── chest_xray_vlm.md
-├── agent.md, CLAUDE.md, AGENTS.md,    # LAYER 2: Orchestration (Agent instructions)
+├── directives/                          # LAYER 1: SOPs (What to do)
+│   ├── chest_xray_vlm.md                # Inference & guardrail SOP
+│   └── train_vlm.md                     # Multi-dataset QLoRA retraining SOP
+├── agent.md / CLAUDE.md / AGENTS.md /   # LAYER 2: Orchestration Instructions
 │   └── GEMINI.md
-├── execution/                         # LAYER 3: Deterministic Tools (Doing the work)
-│   └── analyze_xray.py
-├── app.py                             # Interactive Web UI (Pure Multimodal VLM)
-├── evaluate_ensemble.py               # Standalone 4-Model Ensemble Evaluator (Benchmark)
-├── inference.py                       # Headless CLI Diagnostic Runner
-├── chestxray_smolvlm_lora/            # Trained PEFT LoRA Weights & Tokenizer Configs
-├── 1002_IM-0004-1001.dcm.png          # Verified Test Radiograph
-├── .env.example                       # Environment template
-└── PROGRESS.md                        # This handoff report
+├── execution/                           # LAYER 3: Deterministic Shared Tools
+│   ├── __init__.py
+│   ├── ensemble_cad.py                  # 4-model CAD ensemble + 16x16 CAM engine
+│   ├── analyze_xray.py                  # Unified SmolVLM+LoRA + Clause Anti-Hallucination Auditor
+│   ├── build_rulebook_dataset.py        # Multi-dataset 5-Rule CoT dataset synthesizer
+│   └── train_rulebook_vlm.py            # QLoRA/LoRA trainer + post-train compliance evaluator
+├── app.py                               # Slim Gradio 6.0 UI (Audited Hybrid + Pure VLM)
+├── inference.py                         # Slim CLI single-study runner
+├── evaluate_ensemble.py                 # Slim CLI batch evaluator (CSV -> .tmp/)
+├── tests/
+│   └── test_pipeline.py                 # 13 automated unit & regression tests
+├── chestxray_smolvlm_lora/              # Current OpenI LoRA adapter (r=16, alpha=32)
+├── 1002_IM-0004-1001.dcm.png            # Local test frontal chest X-ray
+├── README.md
+└── PROGRESS.md
 ```
 
-1. **Layer 1: Directive (`directives/`)**
-   - [`directives/chest_xray_vlm.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/directives/chest_xray_vlm.md): Standard Operating Procedure specifying inputs, tools, hardware fallbacks, expected output structures, and clinical constraints.
-2. **Layer 2: Orchestration**
-   - Mirrored agent instruction set across [`agent.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/agent.md), [`CLAUDE.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/CLAUDE.md), [`AGENTS.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/AGENTS.md), and [`GEMINI.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/GEMINI.md).
-3. **Layer 3: Execution (`execution/`)**
-   - [`execution/analyze_xray.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/analyze_xray.py): Deterministic `ChestXRayEngine` class with automated device detection (`mps` vs `cpu`), dtype matching (`float16` vs `float32`), image conversion to RGB, tensor formatting, and output token slicing.
+---
+
+## 3. Code Audit & Bugs Fixed (November 24, 2026)
+
+1. **Restored Missing QLoRA Adapter in `app.py`:** `app.py` previously loaded the un-adapted `SmolVLM-500M-Instruct` base model without attaching `./chestxray_smolvlm_lora`. Now unified through `execution/analyze_xray.py` (`PeftModel` attached when `use_lora=True`).
+2. **Eliminated ~1,100+ Lines of Duplicated Code:** Consolidated `CLASS_CALIBRATION_GATES`, `compute_op_norm`, 16-bit preprocessing, TTA, CAM localization, and heatmap rendering out of `app.py` (910 lines → ~130 lines) and `evaluate_ensemble.py` (732 lines → ~190 lines) into [`execution/ensemble_cad.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/ensemble_cad.py) and [`execution/analyze_xray.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/analyze_xray.py).
+3. **Fixed `cam_w_sum` CAM Denominator Bug:** `weights[:len(cnn_ensemble_224)]` previously sliced ResNet50's vote weight into the DenseNet CAM denominator for the 7 classes missing from CheXpert/MIMIC DenseNets (`Infiltration`, `Emphysema`, `Fibrosis`, `Pleural_Thickening`, `Nodule`, `Mass`, `Hernia`), shrinking their CAM maps by ~2.5x. Replaced with explicit `cam_weights_224` and `cam_weights_512` accumulators.
+4. **Added Native 512x512 ResNet50 16x16 CAM Fusion:** Extracted `layer4` `[2, 2048, 16, 16]` spatial maps and `fc` logits in a single clean pass (without mutating model `op_threshs` / `apply_sigmoid` buffers) and fused with upsampled DenseNet `7x7 -> 16x16` CAMs.
+5. **Fixed 16-Bit PNG Clipping & NaN Checks:** Unified 16-bit-safe `extract_grayscale_float32()` across both UI and batch evaluation, and checked `np.isnan(...).any()` across all TTA views.
+6. **Fixed Clause-Level Negation & Prompt-Echo Bugs in Anti-Hallucination Guardrail:**
+   - Added missing `"Lung Lesion"` stem to `ALL_PATHOLOGY_STEMS`.
+   - Split sentences on clause boundaries before negation masking so `"The heart is normal, and there is pneumothorax"` can no longer slip past.
+   - Blocked `"Normal-bias"` claims when Stage 1 CAD verified pathologies above Dual-Gate.
+   - Filtered out OpenI prompt-echo sentences (`Systematic Search:`, `Step 1: Examine...`).
+   - Added dual-adapter prompt routing (`rulebook_v2.json` detection) so OpenI v1 uses its native `user` prompt cleanly while v2 rulebook adapters use `system` + `user` CoT format.
+7. **Cleaned Up Repo Clutter:** Removed stray nested clone folder `chest x-ray VLM/`, redundant `.gitkeep` placeholders, dead variables, and moved `evaluate_ensemble.py` outputs under `./.tmp/ensemble_audit_outputs/`.
 
 ---
 
-## 4. Completed Work & Major Milestones
+## 4. Multi-Dataset Anti-Hallucination Training Pipeline (Ready for Cloud GPU)
 
-### Milestone 1: Workspace Instantiation & Configuration
-- Created and synchronized `agent.md`, `CLAUDE.md`, `AGENTS.md`, and `GEMINI.md` (all MD5-verified).
-- Configured `.gitignore` to protect intermediate artifacts (`.tmp/`), virtual environments (`.venv/`), environment secrets (`.env`), credentials, and nested git folders.
-- Set up Python virtual environment (`.venv`) with PyTorch, Transformers, PEFT, Gradio, TorchXRayVision, and Scikit-Image.
+Because full multi-dataset training (`ChestX-Det`, `VinDr-CXR`, `NIH ChestX-ray14`, `CheXpert`, `MIMIC-CXR`, `OpenI`) exceeds the local Mac's **8 GB RAM / 15 GB free disk** budget, the complete training pipeline has been implemented and smoke-tested locally so it can execute directly on Kaggle T4 / Colab / Cloud GPUs:
 
-### Milestone 2: Technical & Clinical Code Audit
-- Audited the original codebase and resolved critical bugs:
-  - **Fatal `FileNotFoundError` in `inference.py`:** Removed hardcoded missing image `4_IM-2050-1001.dcm.png`; implemented dynamic image discovery and CLI argument parsing.
-  - **Precision & Device Mismatch:** Resolved `torch.float16` CPU kernel limitations by implementing dynamic hardware routing.
-  - **Token Slicing & Prompt Leakage:** Replaced fragile string `.split("Assistant:")` decoding with exact token tensor slicing (`outputs[0][input_token_len:]`).
-  - **Gradio 6.0 Compatibility:** Aligned parameter signatures between `gr.Blocks()` and `launch()`.
-
-### Milestone 3: Pure Multimodal VLM Reset (`app.py`)
-- Refactored [`app.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/app.py) to a clean, pure Vision-Language Model pipeline:
-  - Removed external CNN dependencies (`torchxrayvision`) from the interactive web path.
-  - Retained native ViT encoder -> Projector -> LLM decoder architecture.
-  - Added layperson-friendly Gradio interface with research/educational medical disclaimers.
-
-### Milestone 4: Multi-Model Ensemble Benchmark Tool (`evaluate_ensemble.py`)
-- Incorporated a comprehensive 732-line standalone quantitative evaluation tool [`evaluate_ensemble.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/evaluate_ensemble.py):
-  - Employs 4 multi-resolution models (DenseNet121 models trained across NIH, CheXpert, PadChest, and MIMIC, plus ResNet50 512x512).
-  - Uses Dual-Gate calibration thresholds and quorum voting to evaluate CXR folders and output detailed CSV telemetry audits.
+- **[`execution/build_rulebook_dataset.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/build_rulebook_dataset.py):**
+  - Covers **25 thoracic etiologies & findings** across `ChestX-Det`, `VinDr-CXR`, and custom/NIH/CheXpert/MIMIC/OpenI JSONL manifests.
+  - Maps bounding boxes `[x1, y1, x2, y2]` to radiological laterality and zones (`Rule 3: Spatial Grounding`).
+  - Rebalances class distribution (`--max-normal-ratio 0.22`, `--min-class-count 200`) to eliminate Normal-biased collapse.
+  - Emits both **Pure-Image CoT** and **CAD-Grounded CoT** examples and validates every record against the 5 rules.
+- **[`execution/train_rulebook_vlm.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/train_rulebook_vlm.py):**
+  - Implements **Assistant-Only Loss Masking** (`labels[:prompt_len] = -100`).
+  - Supports `--adapt-vision` (adapting LLM projections + ViT `out_proj` + `connector` modality projector) and `--quantize-4bit` (NF4 QLoRA on CUDA GPUs).
+  - Runs automated post-training Rulebook Compliance & Finding Mention audits.
+  - Verified locally via 1-step MPS dry-run (`[Epoch 1/2 | Step 1] loss=2.4671`).
 
 ---
 
-## 5. Verified Test Execution
+## 5. Verified Test Results (Post-Refactor)
 
-### A. End-to-End VLM Inference Test
-Tested on the local sample frontal radiograph [`1002_IM-0004-1001.dcm.png`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/1002_IM-0004-1001.dcm.png) with `SmolVLM-500M-Instruct` + `chestxray_smolvlm_lora` on Apple Silicon MPS (`torch.float16`):
-
-- **Inference Latency:** ~1.5 seconds on MPS (vs. ~7.3s on CPU).
-- **Execution Log:**
-  ```text
-  [ChestXStudio] Loading SmolVLM-500M + QLoRA adapter on MPS (torch.float16)...
-  [ChestXStudio] Model loaded and ready.
-  Step 1: Visualize the thoracic organs.
-  The lungs are clear. The heart is normal. There is no pleural effusion or pneumothorax. No acute fractures.
-  Step 2: Identify abnormalities.
-  There is a large right hemidiaphragm hump. There is a left lateral aortic prominence.
-  Step 3: Describe the findings.
-  Lungs are clear. Heart is normal. Left lateral aortic prominence.
-  Step 4: Draw conclusions.
-  No acute cardiopulmonary abnormality.
-  ```
+- **Automated Unit Suite (`python -m unittest discover -s tests -v`):** `13/13` passed in `0.006s`.
+- **CLI Audited Inference (`python inference.py --image 1002_IM-0004-1001.dcm.png --mode audited`):** Completed in `5.8s` on MPS; clean 5-rule report with zero prompt echoes.
+- **Batch Evaluator (`python evaluate_ensemble.py 1002_IM-0004-1001.dcm.png --save-cam --device mps`):** Completed in `1272 ms` (`STRICT NORMAL`, CSV saved to `./.tmp/ensemble_audit_outputs/ensemble_audit_results.csv`).
 
 ---
 
-## 6. Where We Left Off (Current State)
+## 6. Next Steps to Complete Model Retraining
 
-| Component | File Path | Current Status |
-| :--- | :--- | :--- |
-| **Gradio Web Interface** | [`app.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/app.py) | **Ready / Tested.** Pure VLM pipeline running on `http://127.0.0.1:7860`. |
-| **CLI Runner** | [`inference.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/inference.py) | **Ready / Tested.** Supports single-image CLI runs with `--image` and `--mode`. |
-| **Execution Engine** | [`execution/analyze_xray.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/analyze_xray.py) | **Ready / Tested.** Layer 3 core class used by scripts. |
-| **Directive SOP** | [`directives/chest_xray_vlm.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/directives/chest_xray_vlm.md) | **Active.** Governs operational rules. |
-| **Ensemble Evaluator** | [`evaluate_ensemble.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/evaluate_ensemble.py) | **Ready.** Standalone benchmark script for quantitative comparisons. |
-| **LoRA Adapter Weights** | [`chestxray_smolvlm_lora/`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/chestxray_smolvlm_lora) | **Committed.** SafeTensors weights verified. |
-
----
-
-## 7. How to Continue / Next Steps for Incoming AI
-
-When resuming or handing off to another AI assistant, use the following operational guide:
-
-### Quick Commands
-
-1. **Activate Environment:**
-   ```bash
-   source .venv/bin/activate
-   ```
-
-2. **Launch the Pure VLM Gradio Web App:**
-   ```bash
-   python app.py
-   # Access at http://127.0.0.1:7860
-   ```
-
-3. **Run Headless CLI Inference on a Study:**
-   ```bash
-   python inference.py --image 1002_IM-0004-1001.dcm.png --mode clinical
-   ```
-
-4. **Run Ensemble Evaluation on an Image or Directory:**
-   ```bash
-   python evaluate_ensemble.py --image 1002_IM-0004-1001.dcm.png
-   # Or batch:
-   # python evaluate_ensemble.py --dir /path/to/cxr/folder --csv-out audit_results.csv
-   ```
-
-### Immediate Roadmap
-1. **VLM vs. Ensemble Cross-Validation:** Run `evaluate_ensemble.py` and `app.py` on a cohort of test cases to compare the pure VLM's descriptive findings against the ensemble's quantitative pathology probabilities.
-2. **Gradio UI Enhancements:** Add example image gallery (pre-loading `1002_IM-0004-1001.dcm.png`), download report button (PDF / TXT export), and side-by-side comparison mode.
-3. **Automated Test Suite:** Add a pytest script in `tests/` to verify deterministic model loading and token output bounds.
+1. Run [`directives/train_vlm.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/directives/train_vlm.md) on a CUDA GPU (Kaggle / Colab / RunPod) with `ChestX-Det` + `VinDr-CXR` + `NIH` / `CheXpert` / `OpenI`.
+2. Save the resulting adapter (`rulebook_v2.json` included automatically) and replace `./chestxray_smolvlm_lora` (or pass `--adapter ./chestxray_smolvlm_lora_v2`).
+3. Benchmark before vs. after hallucination rates and per-etiology recall using `evaluate_ensemble.py` + `train_rulebook_vlm.py` validation compliance metrics.

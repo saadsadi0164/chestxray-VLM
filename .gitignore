@@ -1,5 +1,9 @@
 # Intermediates (never commit, always regenerated)
 .tmp/
+ensemble_audit_outputs/
+
+# Nested clones
+chest x-ray VLM/
 
 # Environment variables and API keys
 .env
@@ -40,7 +44,3 @@ ENV/
 # OS specific
 .DS_Store
 Thumbs.db
-
-# Nested repositories or clones
-chest x-ray VLM/
-

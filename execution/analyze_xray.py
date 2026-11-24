@@ -1,168 +1,487 @@
 """
-ChestXStudio-VLM: Core Deterministic Execution Module
+ChestXStudio-VLM: Unified Inference & Anti-Hallucination Rulebook Auditor
 Path: execution/analyze_xray.py
 
-Layer 3 tool responsible for model lifecycle, device placement,
-prompt structuring according to clinical rulebook, and token generation.
+Layer 3 deterministic execution module combining:
+  - Stage 1: 4-Model Multi-Resolution Ensemble CAD + 16x16 Spatial CAM (ensemble_cad.py)
+  - Stage 2: SmolVLM-500M-Instruct + QLoRA Medical Adapter (./chestxray_smolvlm_lora)
+  - Clause-level Anti-Hallucination Sentence Guardrail & 5-Rule Clinical Rulebook Synthesis
 """
 
-import os
+from __future__ import annotations
+
+import gc
 import glob
+import os
+import re
+import sys
 import time
-from typing import Optional, Dict, Any, Tuple
+from typing import Any
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText
 from peft import PeftModel
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
-# Default configurations
+from execution.ensemble_cad import (
+    CLASS_CALIBRATION_GATES,
+    evaluate_single_image,
+    load_multi_resolution_ensemble,
+    resolve_cnn_device,
+)
+
 DEFAULT_BASE_MODEL = "HuggingFaceTB/SmolVLM-500M-Instruct"
 DEFAULT_ADAPTER_PATH = "./chestxray_smolvlm_lora"
 
-# Clinical reasoning rulebook aligned with fine-tuning training distribution
 SYSTEM_RULEBOOK = (
-    "You are an expert diagnostic chest X-ray AI assistant following a strict clinical rulebook:\n"
+    "You are an expert diagnostic chest X-ray AI radiologist following the 5-Rule Clinical Rulebook:\n"
     "1. Systematic Search: Evaluate airways, lungs/pleura, mediastinum, heart, and bones.\n"
-    "2. Observation Before Etiology: Describe physical visual findings first before stating the etiology/impression.\n"
-    "3. Spatial Grounding: Specify exact anatomical locations for all positive findings.\n"
-    "4. Explicit Negatives: Explicitly state the absence of critical acute pathologies.\n"
-    "5. Uncertainty Calibration: Use calibrated diagnostic phrasing when multiple etiologies fit."
+    "2. Observation Before Etiology: Describe physical visual findings FIRST before stating the diagnosis.\n"
+    "3. Spatial Grounding: Include the exact anatomical location for every positive finding.\n"
+    "4. Explicit Negatives: State the absence of unmentioned critical acute pathologies "
+    "(pneumothorax, pleural effusion, focal consolidation, pulmonary edema).\n"
+    "5. Uncertainty Calibration: Use calibrated diagnostic phrasing when findings are mild or overlapping.\n\n"
+    "Format the report in these exact 3 sections:\n"
+    "1. Systematic Visual Findings\n"
+    "2. Spatial Localization\n"
+    "3. Clinical Impression"
 )
 
-CLINICAL_PROMPT = (
-    "Examine this frontal chest X-ray. Provide systematic physical findings first, "
-    "followed by the clinical etiology and impression."
+ALL_PATHOLOGY_STEMS: dict[str, list[str]] = {
+    "Pneumothorax": ["pneumothora"],
+    "Effusion": ["effusion", "pleural fluid", "costophrenic blunting", "meniscus"],
+    "Consolidation": ["consolidat"],
+    "Pneumonia": ["pneumonia"],
+    "Edema": ["edema", "congest"],
+    "Atelectasis": ["atelecta", "volume loss"],
+    "Cardiomegaly": ["cardiomegal", "enlarged heart", "enlarged cardiac"],
+    "Enlarged Cardiomediastinum": ["widened mediastin", "enlarged cardiomediastin"],
+    "Lung Opacity": ["opacit"],
+    "Infiltration": ["infiltrat"],
+    "Mass": ["mass"],
+    "Nodule": ["nodul"],
+    "Lung Lesion": ["lesion"],
+    "Emphysema": ["emphysem", "hyperinflat"],
+    "Fibrosis": ["fibros", "reticular"],
+    "Pleural_Thickening": ["pleural thickening"],
+    "Fracture": ["fractur"],
+    "Hernia": ["hernia"],
+}
+
+_CLAUSE_SPLIT_RE = re.compile(
+    r"\s*(?:,|;|\bbut\b|\bhowever\b|\balthough\b|\bwhereas\b|\bwhile\b|\band\b)\s*",
+    flags=re.IGNORECASE,
+)
+_NEGATION_RE = re.compile(
+    r"\b(?:no|not|without|negative for|free of|absence of|absent|clear of|"
+    r"unremarkable|within normal limits|normal|ruled out|no evidence of)\b.*",
+    flags=re.IGNORECASE,
+)
+_NORMAL_BIAS_CLAIM_RE = re.compile(
+    r"\b(?:no acute cardiopulmonary|no acute disease|no acute abnormality|"
+    r"lungs are clear|clear bilaterally|normal chest radiograph|unremarkable chest)\b",
+    flags=re.IGNORECASE,
+)
+_PROMPT_ECHO_RE = re.compile(
+    r"(?:systematic search:|observation before etiology:|spatial grounding:|"
+    r"explicit negatives:|uncertainty calibration:|evaluate airways|"
+    r"describe physical visual|verified ensemble cad|format the report|"
+    r"clinical rulebook|analyze this chest x-ray step-by-step|"
+    r"^\s*step\s+\d+\s*:|\bexamine the\b|\bobserve the\b|\blook at the\b|\bevaluate the\b)",
+    flags=re.IGNORECASE,
+)
+_SECTION_HEADER_RE = re.compile(
+    r"^(?:[12345]\.|#|\*\*|visual findings:|clinical impression)",
+    flags=re.IGNORECASE,
 )
 
-LAYPERSON_PROMPT = (
-    "Examine this frontal chest X-ray following the clinical rulebook. "
-    "Provide a structured, patient-accessible summary with the following sections:\n"
-    "1. Systematic Physical Findings\n"
-    "2. Anatomical Localization\n"
-    "3. Clinical Impression & Next Steps (Educational Only)"
-)
 
-
-class ChestXRayEngine:
-    def __init__(self, base_model_id: str = DEFAULT_BASE_MODEL, adapter_path: str = DEFAULT_ADAPTER_PATH):
-        self.base_model_id = base_model_id
-        self.adapter_path = adapter_path
-        self.device, self.dtype = self._detect_hardware()
-        
-        self.processor = None
-        self.model = None
-        self._load_pipeline()
-
-    @staticmethod
-    def _detect_hardware() -> Tuple[str, torch.dtype]:
-        """Dynamically detect optimal device and safe precision."""
+def resolve_llm_device(preferred: str = "auto") -> tuple[str, torch.dtype]:
+    """Selects optimal device and safe dtype (float16 on MPS/CUDA, float32 on CPU)."""
+    if preferred == "auto":
+        if torch.backends.mps.is_available():
+            return "mps", torch.float16
         if torch.cuda.is_available():
             return "cuda", torch.float16
-        elif torch.backends.mps.is_available():
-            return "mps", torch.float16
-        else:
-            return "cpu", torch.float32
+        return "cpu", torch.float32
+    dtype = torch.float16 if preferred in ("mps", "cuda") else torch.float32
+    return preferred, dtype
 
-    def _load_pipeline(self):
-        """Loads processor, base vision-language model, and attaches LoRA adapter."""
-        if not os.path.exists(self.adapter_path):
-            raise FileNotFoundError(f"Adapter directory not found at: {self.adapter_path}")
 
-        print(f"[Engine] Initializing on {self.device.upper()} with dtype {self.dtype}...")
+def _load_hf_with_offline_fallback(loader_fn, model_id: str, **kwargs):
+    """Tries local Hugging Face cache first to avoid DNS timeouts when offline."""
+    try:
+        return loader_fn(model_id, local_files_only=True, **kwargs)
+    except Exception:
+        return loader_fn(model_id, local_files_only=False, **kwargs)
 
-        # Load processor from adapter path (preserves customized special tokens and chat templates)
+
+def filter_unverified_vlm_sentences(
+    vlm_text: str,
+    allowed_raw_labels: set[str],
+) -> list[str]:
+    """
+    Clause-level anti-hallucination guardrail:
+      - Splits sentences into clauses BEFORE applying negation masking, so a normal
+        first clause ('Heart is normal, and there is pneumothorax') cannot mask an
+        unverified pathology in a later clause.
+      - Rejects contradicting normal-bias sentences when CAD confirmed abnormalities.
+    """
+    if not vlm_text:
+        return []
+
+    allowed_stems: set[str] = set()
+    for lbl in allowed_raw_labels:
+        allowed_stems.update(ALL_PATHOLOGY_STEMS.get(lbl, []))
+        if lbl in ("Consolidation", "Pneumonia", "Atelectasis", "Edema", "Infiltration"):
+            allowed_stems.add("opacit")
+        if lbl in ("Mass", "Nodule"):
+            allowed_stems.add("lesion")
+
+    kept: list[str] = []
+    for raw_sent in re.split(r"(?<=[.!?])\s+", vlm_text):
+        s_clean = raw_sent.strip()
+        if not s_clean or len(s_clean) <= 15:
+            continue
+        if _SECTION_HEADER_RE.match(s_clean) or _PROMPT_ECHO_RE.search(s_clean):
+            continue
+
+        # Block "normal chest" claims when CAD verified real pathology above Dual-Gate
+        if allowed_raw_labels and _NORMAL_BIAS_CLAIM_RE.search(s_clean):
+            continue
+
+        hallucinated = False
+        for clause in _CLAUSE_SPLIT_RE.split(s_clean.lower()):
+            clause = clause.strip()
+            if not clause:
+                continue
+            unnegated = _NEGATION_RE.sub(" ", clause)
+            for _, stems in ALL_PATHOLOGY_STEMS.items():
+                if any(st in unnegated for st in stems) and not any(st in allowed_stems for st in stems):
+                    hallucinated = True
+                    break
+            if hallucinated:
+                break
+
+        if not hallucinated:
+            kept.append(s_clean.rstrip("."))
+
+    return kept[:2]
+
+
+def synthesize_audited_rulebook_report(
+    vlm_raw_text: str,
+    cad_findings: list[dict[str, Any]],
+    total_cad_models: int,
+    use_vlm_commentary: bool = True,
+) -> str:
+    """
+    Constructs a strict 5-Rule Clinical Rulebook report grounded on verified Stage 1
+    CAD observations, spatial CAM localization, and audited VLM commentary.
+    """
+    detected_raw_labels = {d["raw_label"] for d in cad_findings}
+
+    acute_checks = [
+        ({"Pneumothorax"}, "pneumothorax"),
+        ({"Effusion"}, "pleural effusion"),
+        ({"Consolidation", "Pneumonia", "Infiltration", "Lung Opacity"}, "focal lobar consolidation"),
+        ({"Edema"}, "pulmonary edema"),
+        ({"Fracture"}, "acute osseous fracture"),
+    ]
+    explicit_negatives = [
+        neg_name for label_set, neg_name in acute_checks
+        if not (label_set & detected_raw_labels)
+    ]
+    neg_sentence = (
+        f"No radiographic evidence of {', '.join(explicit_negatives)}."
+        if explicit_negatives else ""
+    )
+
+    verified_vlm = (
+        filter_unverified_vlm_sentences(vlm_raw_text, detected_raw_labels)
+        if use_vlm_commentary and vlm_raw_text
+        else []
+    )
+
+    if not cad_findings:
+        base_obs = [
+            "Trachea and central airways are midline and patent",
+            "Bilateral lung fields are well-aerated and clear without focal parenchymal opacity",
+            "Cardiomediastinal silhouette is within normal limits and bilateral costophrenic angles are sharp",
+        ]
+        if verified_vlm:
+            base_obs.extend(verified_vlm[:1])
+        sec1 = ". ".join(base_obs) + ". " + neg_sentence
+        sec2 = "Bilateral lung parenchyma, costophrenic angles, pleura, and cardiomediastinal silhouette."
+        sec3 = "No acute cardiopulmonary process identified on frontal chest radiograph."
+    else:
+        obs_sentences: list[str] = []
+        loc_entries: list[str] = []
+        imp_entries: list[str] = []
+
+        for idx, item in enumerate(cad_findings, start=1):
+            loc_lower = item["location"][0].lower() + item["location"][1:]
+            obs_sentences.append(
+                f"Visual evaluation demonstrates {item['observation']} localized to the {loc_lower}"
+            )
+            if item["location"] not in loc_entries:
+                loc_entries.append(item["location"])
+
+            cal_p = item["cal_prob"]
+            raw_p = item["raw_prob"]
+            if cal_p >= 0.72 and raw_p >= 0.40:
+                cal_phrase = "Findings are strongly consistent with"
+            elif cal_p >= 0.62:
+                cal_phrase = "Radiographic appearance is consistent with"
+            else:
+                cal_phrase = "Mild or borderline radiographic features suggestive of"
+
+            imp_entries.append(
+                f"{idx}. {cal_phrase} {item['clinical_name']} involving the {loc_lower} "
+                f"(Ensemble Calibrated: {cal_p:.0%} | Raw Sigmoid: {raw_p:.0%})"
+            )
+
+        if not ({"Cardiomegaly", "Enlarged Cardiomediastinum"} & detected_raw_labels):
+            obs_sentences.append("The cardiac silhouette and central mediastinal contours are within normal limits")
+
+        if verified_vlm:
+            obs_sentences.extend(verified_vlm[:1])
+
+        sec1 = ". ".join(obs_sentences) + ". " + neg_sentence
+        sec2 = "; ".join(loc_entries) + "."
+        sec3 = "\n".join(imp_entries) + "\nClinical correlation is recommended."
+
+    ensemble_header = (
+        f"[Multi-Resolution Ensemble ({total_cad_models} Models: 224x224 + 512x512) + Quorum Dual-Gate Audit]\n"
+        + (
+            "Status: STRICT NORMAL (All 18 pathologies below Dual-Gate & Quorum threshold)"
+            if not cad_findings
+            else " | ".join(
+                f"{d['clinical_name'].title()}: {d['cal_prob']:.0%} cal / {d['raw_prob']:.0%} raw ({d['location']})"
+                for d in cad_findings
+            )
+        )
+    )
+
+    return (
+        f"{ensemble_header}\n\n"
+        f"1. Systematic Visual Findings:\n{sec1.strip()}\n\n"
+        f"2. Spatial Localization:\n{sec2.strip()}\n\n"
+        f"3. Clinical Impression:\n{sec3.strip()}"
+    )
+
+
+class ChestXRayPipeline:
+    """
+    Unified ChestXStudio Inference Pipeline.
+    Supports:
+      - Stage 1 CAD Ensemble (4 multi-resolution models + 16x16 CAM)
+      - Stage 2 SmolVLM-500M-Instruct + QLoRA medical adapter (do_image_splitting=False)
+      - Audited Rulebook synthesis or standalone Pure-VLM mode
+    """
+
+    def __init__(
+        self,
+        base_model_id: str = DEFAULT_BASE_MODEL,
+        adapter_path: str = DEFAULT_ADAPTER_PATH,
+        use_lora: bool = True,
+        load_cad: bool = True,
+        cnn_device: str = "auto",
+        llm_device: str = "auto",
+    ):
+        self.base_model_id = base_model_id
+        self.adapter_path = adapter_path
+        self.use_lora = use_lora and os.path.isdir(adapter_path)
+        self.is_rulebook_v2 = os.path.isfile(os.path.join(adapter_path, "rulebook_v2.json"))
+
+        self.cnn_device = resolve_cnn_device(cnn_device)
+        self.llm_device, self.llm_dtype = resolve_llm_device(llm_device)
+
+        self.ensemble_224: list[dict[str, Any]] = []
+        self.resnet_512: dict[str, Any] | None = None
+        if load_cad:
+            self.ensemble_224, self.resnet_512 = load_multi_resolution_ensemble(device_str=self.cnn_device)
+
+        self.processor = None
+        self.llm_model = None
+        self._load_vlm()
+
+    def _load_vlm(self) -> None:
+        print(f"[VLM Engine] Loading {self.base_model_id} on {self.llm_device.upper()} ({self.llm_dtype})...")
+        proc_source = self.adapter_path if self.use_lora else self.base_model_id
         try:
-            self.processor = AutoProcessor.from_pretrained(self.adapter_path)
+            self.processor = _load_hf_with_offline_fallback(AutoProcessor.from_pretrained, proc_source)
         except Exception:
-            self.processor = AutoProcessor.from_pretrained(self.base_model_id)
+            self.processor = _load_hf_with_offline_fallback(AutoProcessor.from_pretrained, self.base_model_id)
 
-        # Load base model with device-safe precision
-        base_model = AutoModelForImageTextToText.from_pretrained(
+        self.processor.image_processor.do_image_splitting = False
+        if hasattr(self.processor, "tokenizer"):
+            self.processor.tokenizer.padding_side = "left"
+
+        base_model = _load_hf_with_offline_fallback(
+            AutoModelForImageTextToText.from_pretrained,
             self.base_model_id,
-            torch_dtype=self.dtype,
-            low_cpu_mem_usage=True
+            dtype=self.llm_dtype,
+            low_cpu_mem_usage=True,
         )
 
-        # Attach LoRA adapter
-        self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
-        self.model = self.model.to(self.device)
-        self.model.eval()
-        print("[Engine] Model and adapter loaded successfully.")
+        if self.use_lora:
+            print(f"[VLM Engine] Attaching QLoRA medical adapter: {self.adapter_path}")
+            model = PeftModel.from_pretrained(base_model, self.adapter_path)
+        else:
+            model = base_model
+
+        self.llm_model = model.to(device=self.llm_device, dtype=self.llm_dtype)
+        self.llm_model.eval()
+        print("[VLM Engine] SmolVLM ready.")
+
+    def _generate_vlm_text(
+        self,
+        image: Image.Image,
+        user_prompt: str,
+        max_new_tokens: int = 200,
+    ) -> str:
+        image_rgb = image.convert("RGB").resize((512, 512))
+        if self.is_rulebook_v2 or not self.use_lora:
+            messages = [
+                {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK}]},
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_prompt}]},
+            ]
+        else:
+            # OpenI v1 adapter was trained without a system role; match its native user prompt
+            # to avoid system-prompt echo while preserving systematic findings -> impression order.
+            native_prompt = (
+                f"{user_prompt}\n"
+                "Examine this frontal chest X-ray. Provide systematic physical findings first, "
+                "followed by the clinical etiology and impression."
+            )
+            messages = [
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": native_prompt}]},
+            ]
+        prompt = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        inputs = self.processor(text=[prompt], images=[[image_rgb]], return_tensors="pt")
+        inputs = {
+            k: v.to(device=self.llm_device, dtype=self.llm_dtype) if v.is_floating_point() else v.to(device=self.llm_device)
+            for k, v in inputs.items()
+        }
+
+        input_len = inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            output_ids = self.llm_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                repetition_penalty=1.15,
+            )
+        decoded = self.processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
+
+        del inputs, output_ids
+        gc.collect()
+        if self.llm_device == "mps":
+            torch.mps.empty_cache()
+        return decoded
 
     def analyze(
         self,
         image: Image.Image,
-        mode: str = "clinical",
-        max_new_tokens: int = 250,
-        temperature: float = 0.0
-    ) -> Dict[str, Any]:
+        sensitivity_mode: str = "Balanced Clinical (Recommended)",
+        use_vlm: bool = True,
+        mode: str = "audited",
+    ) -> dict[str, Any]:
         """
-        Executes inference on a PIL Image with deterministic token slicing.
-        
+        Runs end-to-end chest radiograph interpretation.
+
         Args:
-            image: PIL.Image instance
-            mode: 'clinical' (radiology report) or 'layperson' (structured patient breakdown)
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature (0.0 for greedy deterministic generation)
+            image: PIL.Image input
+            sensitivity_mode: Screening sensitivity mode string
+            use_vlm: Whether to invoke SmolVLM commentary in audited mode
+            mode: 'audited' (Stage 1 CAD + Stage 2 LoRA VLM + Guardrail) or 'pure_vlm'
         """
         if image is None:
             raise ValueError("Input image cannot be None.")
 
-        rgb_image = image.convert("RGB")
-        user_prompt = LAYPERSON_PROMPT if mode == "layperson" else CLINICAL_PROMPT
+        t0 = time.perf_counter()
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": f"{SYSTEM_RULEBOOK}\n\n{user_prompt}"}
-                ]
+        if mode == "pure_vlm" or not self.ensemble_224:
+            raw_report = self._generate_vlm_text(
+                image,
+                "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook.",
+                max_new_tokens=250,
+            )
+            return {
+                "report": raw_report,
+                "overlay_img": image.convert("RGB"),
+                "telemetry_rows": [],
+                "cad_findings": [],
+                "near_misses": [],
+                "latency_seconds": round(time.perf_counter() - t0, 2),
+                "mode": "pure_vlm",
             }
-        ]
 
-        prompt_str = self.processor.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = self.processor(text=prompt_str, images=[rgb_image], return_tensors="pt")
+        if "High Sensitivity" in sensitivity_mode:
+            sens_offset = 0.04
+        elif "High Specificity" in sensitivity_mode:
+            sens_offset = -0.05
+        else:
+            sens_offset = 0.0
 
-        # Route tensors to target device and match model float precision
-        inputs = {
-            k: v.to(self.device).to(self.dtype) if v.is_floating_point() else v.to(self.device)
-            for k, v in inputs.items()
-        }
+        cad_res = evaluate_single_image(
+            image,
+            ensemble_224=self.ensemble_224,
+            resnet_512=self.resnet_512,
+            sensitivity_offset=sens_offset,
+            device_str=self.cnn_device,
+        )
+        cad_findings = cad_res["top_findings"]
 
-        input_token_len = inputs["input_ids"].shape[1]
-        start_time = time.time()
+        raw_vlm_text = ""
+        if use_vlm:
+            if not cad_findings:
+                cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold."
+            else:
+                cad_summary = "; ".join(
+                    f"{d['clinical_name']} at {d['location']} (Calibrated: {d['cal_prob']:.0%})"
+                    for d in cad_findings
+                )
+            user_prompt = (
+                f"Verified Ensemble CAD findings: {cad_summary}.\n"
+                "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
+            )
+            raw_vlm_text = self._generate_vlm_text(image, user_prompt, max_new_tokens=160)
 
-        do_sample = temperature > 0.0
-        generation_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample
-        }
-        if do_sample:
-            generation_kwargs["temperature"] = temperature
-
-        with torch.no_grad():
-            outputs = self.model.generate(**inputs, **generation_kwargs)
-
-        # Slicing: decode ONLY the newly generated tokens to eliminate prompt leakage
-        generated_ids = outputs[0][input_token_len:]
-        report_text = self.processor.decode(generated_ids, skip_special_tokens=True).strip()
-        elapsed_sec = round(time.time() - start_time, 2)
+        total_models = len(self.ensemble_224) + (1 if self.resnet_512 is not None else 0)
+        final_report = synthesize_audited_rulebook_report(
+            raw_vlm_text,
+            cad_findings,
+            total_cad_models=total_models,
+            use_vlm_commentary=use_vlm,
+        )
 
         return {
-            "report": report_text,
-            "latency_seconds": elapsed_sec,
-            "device": self.device,
-            "mode": mode
+            "report": final_report,
+            "overlay_img": cad_res["overlay_img"],
+            "telemetry_rows": cad_res["telemetry_rows"],
+            "cad_findings": cad_findings,
+            "near_misses": cad_res["near_misses"],
+            "latency_seconds": round(time.perf_counter() - t0, 2),
+            "mode": "audited",
         }
 
 
-def find_default_xray(search_dir: str = ".") -> Optional[str]:
-    """Scans for valid X-ray image files in the directory."""
-    patterns = ["*.png", "*.jpg", "*.jpeg", "*.dcm.png"]
-    found = []
+def find_default_xray(search_dir: str = ".") -> str | None:
+    """Scans workspace for a sample frontal X-ray image (excluding caches/envs)."""
+    patterns = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
+    found: list[str] = []
     for pattern in patterns:
         found.extend(glob.glob(os.path.join(search_dir, "**", pattern), recursive=True))
-    # Exclude checkpoints or cache
-    valid_images = [f for f in found if ".venv" not in f and ".tmp" not in f]
+    valid_images = sorted(
+        f for f in found
+        if ".venv" not in f and ".tmp" not in f and "ensemble_audit_outputs" not in f
+    )
     return valid_images[0] if valid_images else None
