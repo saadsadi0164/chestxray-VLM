@@ -351,7 +351,11 @@ class ChestXRayPipeline:
         user_prompt: str,
         max_new_tokens: int = 384,
     ) -> str:
-        image_rgb = image.convert("RGB").resize((512, 512))
+        if self.is_rulebook_v2:
+            from execution.build_rulebook_dataset import normalize_cxr_to_rgb
+            image_rgb = normalize_cxr_to_rgb(image, image_size=512)
+        else:
+            image_rgb = image.convert("RGB").resize((512, 512))
         if self.is_rulebook_v2 or not self.use_lora:
             messages = [
                 {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK}]},

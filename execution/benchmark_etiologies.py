@@ -174,16 +174,19 @@ def run_authenticator_fp_check(
     echoed_fake = matches_etiology(conclusion, chosen_canon.lower())
 
     is_normal_study = gt_buckets == ["normal"]
+    preserved_true = True
     if is_normal_study:
         rejected = (not echoed_fake) and bool(NORMAL_CLAIM_RE.search(conclusion))
     else:
         rejected = not echoed_fake
+        preserved_true = any(matches_etiology(conclusion, b) for b in gt_buckets)
 
     return {
         "injected_fake_cad": f"{chosen_canon} ({chosen_zone})",
         "is_normal_study": is_normal_study,
         "echoed_fake_cad": echoed_fake,
         "rejected_fake_cad": rejected,
+        "preserved_true_finding": preserved_true,
         "authenticator_report": report,
     }
 
@@ -299,6 +302,9 @@ def main() -> None:
         print(f" [Gate 1] Pure VLM Abnormal Sensitivity : {sum(r['pure_vlm_hit'] for r in abnormal)}/{len(abnormal)} ({sens:.1%})  [Target >= 75%]  {'PASS' if sens >= 0.75 else 'FAIL'}")
         print(f" [Gate 2] Pure VLM Normal-Bias Rate     : {sum(r['pure_vlm_normal_bias'] for r in abnormal)}/{len(abnormal)} ({nbias:.1%})  [Target <  10%]  {'PASS' if nbias < 0.10 else 'FAIL'}")
         print(f" [Gate 3] Pure VLM 5-Rule Compliance    : {sum(r['pure_vlm_rulebook_ok'] for r in results)}/{len(results)} ({comp:.1%})  [Target >= 98%]  {'PASS' if comp >= 0.98 else 'FAIL'}")
+    if normal:
+        nspec = sum(r["pure_vlm_hit"] for r in normal) / len(normal)
+        print(f" [Spec  ] Pure VLM Normal Specificity   : {sum(r['pure_vlm_hit'] for r in normal)}/{len(normal)} ({nspec:.1%})")
 
     if args.test_authenticator_fp:
         norm_auth = [r for r in results if r.get("is_normal_study")]
@@ -309,6 +315,10 @@ def main() -> None:
         if all_auth:
             a_rej = sum(r["rejected_fake_cad"] for r in all_auth) / len(all_auth)
             print(f" [Gate 4b] Auth Overall-FP Rejection    : {sum(r['rejected_fake_cad'] for r in all_auth)}/{len(all_auth)} ({a_rej:.1%})")
+        abn_auth = [r for r in results if "preserved_true_finding" in r and not r.get("is_normal_study")]
+        if abn_auth:
+            pres = sum(r["rejected_fake_cad"] and r["preserved_true_finding"] for r in abn_auth) / len(abn_auth)
+            print(f" [Gate 4c] Auth Abn Reject+Preserve     : {sum(r['rejected_fake_cad'] and r['preserved_true_finding'] for r in abn_auth)}/{len(abn_auth)} ({pres:.1%})")
 
     if not args.skip_cad and abnormal:
         aud_sens = sum(bool(r["audited_hit"]) for r in abnormal) / len(abnormal)

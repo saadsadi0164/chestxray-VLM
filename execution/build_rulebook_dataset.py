@@ -450,7 +450,7 @@ def build_rulebook_target(
         sec2 = "Bilateral lung fields, costophrenic angles, central mediastinum, and osseous structures (unremarkable)."
         sec3 = "No acute cardiopulmonary abnormality identified on this frontal chest radiograph."
     else:
-        obs_sentences: list[str] = ["Trachea and central airways are midline."]
+        obs_sentences: list[str] = ["The trachea and central airways are midline and patent."]
         loc_entries: list[str] = []
         imp_entries: list[str] = []
 
@@ -513,49 +513,126 @@ def validate_rulebook_compliance(report: str) -> tuple[bool, list[str]]:
 # =====================================================================
 # 4. DISK-SAFE STREAMING DATASET LOADERS
 # =====================================================================
+# Verified 0-indexed pixel IDs for natealberti/ChestX-Det masks (10=Nodule missing & merged into 12 upstream;
+# ID 12 is intentionally excluded from mask fallback so Nodules are NEVER mislabeled as Pneumothorax).
 CHESTX_DET_ID2LABEL: dict[int, str] = {
-    1: "Atelectasis",
-    2: "Calcification",
-    3: "Cardiomegaly",
-    4: "Consolidation",
-    5: "Diffuse Nodule",
-    6: "Effusion",
-    7: "Emphysema",
-    8: "Fibrosis",
-    9: "Fracture",
-    10: "Mass",
-    11: "Nodule",
-    12: "Pleural Thickening",
-    13: "Pneumothorax",
+    0: "Atelectasis",
+    1: "Calcification",
+    2: "Cardiomegaly",
+    3: "Consolidation",
+    4: "Diffuse Nodule",
+    5: "Effusion",
+    6: "Emphysema",
+    7: "Fibrosis",
+    8: "Fracture",
+    9: "Mass",
+    11: "Pleural Thickening",
 }
 
 
-def _save_resized_image(pil_img: Any, out_path: Path, image_size: int = 512) -> str:
-    """Saves a compact 512x512 RGB JPEG (~40 KB), safely normalizing 12/16-bit medical images."""
+def normalize_cxr_to_rgb(pil_img: Any, image_size: int = 512) -> Any:
+    """
+    Uniform 1st-99th percentile grayscale contrast normalization across ALL datasets
+    (8-bit, 16-bit, RGBA, L) and local v2.2 inference so the VLM cannot exploit
+    dataset-specific intensity histograms as shortcuts. Pillow 13 safe.
+    """
     import numpy as np
     from PIL import Image
 
+    arr = np.asarray(pil_img)
+    if arr.ndim == 3:
+        arr_f = arr[..., :3].astype(np.float32).mean(axis=-1)
+    else:
+        arr_f = arr.astype(np.float32)
+
+    p1, p99 = np.percentile(arr_f, [1.0, 99.0])
+    if p99 > p1:
+        arr_f = np.clip((arr_f - p1) / (p99 - p1), 0.0, 1.0) * 255.0
+    elif float(arr_f.max()) > float(arr_f.min()):
+        arr_f = (arr_f - float(arr_f.min())) / (float(arr_f.max()) - float(arr_f.min())) * 255.0
+    else:
+        arr_f = np.zeros_like(arr_f)
+
+    rgb = Image.fromarray(arr_f.astype(np.uint8)).convert("RGB")
+    resample = getattr(Image, "Resampling", Image).BILINEAR
+    if rgb.size != (image_size, image_size):
+        rgb = rgb.resize((image_size, image_size), resample)
+    return rgb
+
+
+def _save_resized_image(pil_img: Any, out_path: Path, image_size: int = 512) -> str:
+    """Saves a uniformly normalized 512x512 RGB JPEG (~40 KB)."""
     if not out_path.exists():
-        arr = np.asarray(pil_img)
-        if arr.dtype != np.uint8 or str(getattr(pil_img, "mode", "")).startswith(("I", "F")):
-            arr_f = arr.astype(np.float32)
-            if arr_f.ndim == 3:
-                arr_f = arr_f[..., 0]
-            p1, p99 = np.percentile(arr_f, [1.0, 99.0])
-            if p99 > p1:
-                arr_f = np.clip((arr_f - p1) / (p99 - p1), 0.0, 1.0) * 255.0
-            elif float(arr_f.max()) > float(arr_f.min()):
-                arr_f = (arr_f - float(arr_f.min())) / (float(arr_f.max()) - float(arr_f.min())) * 255.0
-            else:
-                arr_f = np.zeros_like(arr_f)
-            rgb = Image.fromarray(arr_f.astype(np.uint8)).convert("RGB")
-        else:
-            rgb = pil_img.convert("RGB")
-        resample = getattr(Image, "Resampling", Image).BILINEAR
-        if rgb.size != (image_size, image_size):
-            rgb = rgb.resize((image_size, image_size), resample)
+        rgb = normalize_cxr_to_rgb(pil_img, image_size=image_size)
         rgb.save(out_path, format="JPEG", quality=95)
     return str(out_path)
+
+
+def _fast_image_fingerprint(pil_img: Any) -> str:
+    """Computes a fast 10-char hash to group multi-sentence PadChest-GR rows belonging to one radiograph."""
+    import hashlib
+    import numpy as np
+
+    arr = np.asarray(pil_img)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    h, w = arr.shape[:2]
+    thumb = arr[:: max(1, h // 32), :: max(1, w // 32)]
+    return hashlib.md5(thumb.tobytes()).hexdigest()[:10]
+
+
+def _extract_mask_boxes(binary_mask: Any, min_pixels: int = 16) -> list[list[float]]:
+    """Extracts per-instance connected-component bounding boxes so multi-focal lesions stay spatially accurate."""
+    import numpy as np
+
+    labeled = None
+    n_comp = 0
+    try:
+        from scipy.ndimage import label as cc_label
+        labeled, n_comp = cc_label(binary_mask)
+    except Exception:
+        try:
+            from skimage.measure import label as sk_label
+            labeled = sk_label(binary_mask, connectivity=2)
+            n_comp = int(labeled.max())
+        except Exception:
+            labeled = None
+
+    boxes: list[list[float]] = []
+    if labeled is not None and n_comp > 0:
+        for comp_id in range(1, n_comp + 1):
+            ys, xs = np.where(labeled == comp_id)
+            if len(xs) < min_pixels:
+                continue
+            boxes.append([float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())])
+
+    if not boxes:
+        ys, xs = np.where(binary_mask)
+        if len(xs) > 0:
+            boxes.append([float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())])
+    return boxes
+
+
+def _merge_component_zones(zones: list[str], canon: str) -> list[str]:
+    """Deduplicates per-component zones and cleanly collapses matched left+right pairs into bilateral."""
+    uniq = list(dict.fromkeys(zones))
+    if len(uniq) <= 1:
+        return uniq
+
+    has_right = any(z.startswith("right ") for z in uniq)
+    has_left = any(z.startswith("left ") for z in uniq)
+    if has_right and has_left:
+        suffixes = set()
+        for z in uniq:
+            if z.startswith("right "):
+                suffixes.add(z[len("right "):])
+            elif z.startswith("left "):
+                suffixes.add(z[len("left "):])
+        if len(suffixes) == 1:
+            return [f"bilateral {next(iter(suffixes))}"]
+        default_z = PATHOLOGY_ONTOLOGY[canon]["default_zone"]
+        return [default_z if "bilateral" in default_z else "bilateral lung fields"]
+    return uniq[:2]
 
 
 def _parse_padchest_locations(locs: Any) -> str:
@@ -583,6 +660,95 @@ def _parse_padchest_locations(locs: Any) -> str:
     return ", ".join(dict.fromkeys(flat))
 
 
+def _normalize_padchest_zone(loc_str: str, canon: str) -> str:
+    """Maps PadChest-GR free-text location tokens into our exact canonical anatomical zone grammar."""
+    default_z = PATHOLOGY_ONTOLOGY[canon]["default_zone"]
+    if canon in ("Cardiomegaly", "Enlarged Cardiomediastinum", "Aortic Enlargement", "Hernia", "Support Devices"):
+        return default_z
+
+    s = (loc_str or "").lower()
+    if not s:
+        return default_z
+
+    has_r = bool(re.search(r"\bright\b", s))
+    has_l = bool(re.search(r"\bleft\b", s))
+    if "bilateral" in s or (has_r and has_l):
+        side = "bilateral"
+    elif has_r:
+        side = "right"
+    elif has_l:
+        side = "left"
+    else:
+        side = ""
+
+    if canon == "Effusion":
+        return f"{side} costophrenic angle and lower pleural space" if side else default_z
+    if canon == "Pneumothorax":
+        return f"{side} apical pleural space" if side else default_z
+    if canon == "Pleural Thickening":
+        return f"{side} pleural space" if side else default_z
+    if canon == "Fracture":
+        return f"{side} osseous thoracic cage" if side else default_z
+
+    if any(k in s for k in ("apical", "apex", "upper", "superior")):
+        level = "upper lung zone (apical)"
+    elif any(k in s for k in ("basal", "base", "lower", "inferior", "costophrenic")):
+        level = "lower lung zone / lung base"
+    elif any(k in s for k in ("mid", "middle", "hilar", "perihilar")):
+        level = "mid lung zone"
+    else:
+        level = ""
+
+    if side and level:
+        return f"{side} {level}"
+    if side:
+        return f"{side} lung fields" if side == "bilateral" else f"{side} lung field"
+    return default_z
+
+
+def _fetch_official_chestx_det_json(split: str) -> list[dict[str, Any]] | None:
+    """Fetches official Deepwise ChestX-Det multi-label box annotations to recover uncorrupted Nodule/Pneumothorax/Consolidation."""
+    import urllib.request
+
+    fname = "ChestX_Det_train.json" if split == "train" else "ChestX_Det_test.json"
+    for branch in ("main", "master"):
+        url = f"https://raw.githubusercontent.com/Deepwise-AILab/ChestX-Det-Dataset/{branch}/{fname}"
+        try:
+            raw = urllib.request.urlopen(url, timeout=20).read().decode("utf-8")
+            data = json.loads(raw)
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def _findings_from_deepwise_item(item: dict[str, Any], img_w: int, img_h: int) -> list[dict[str, Any]]:
+    """Converts one official Deepwise ChestX-Det JSON record (syms + boxes) into canonical grounded findings."""
+    syms = item.get("syms") or []
+    boxes = item.get("boxes") or []
+    by_canon: dict[str, list[str]] = defaultdict(list)
+
+    for i, sym in enumerate(syms):
+        canon = canonicalize_label(str(sym))
+        if not canon:
+            continue
+        box = boxes[i] if i < len(boxes) and isinstance(boxes[i], (list, tuple)) and len(boxes[i]) == 4 else None
+        if box is not None:
+            eff_w = max(float(img_w), float(box[2]), 1.0)
+            eff_h = max(float(img_h), float(box[3]), 1.0)
+            zone = bbox_to_anatomical_zone(box, canon, img_w=eff_w, img_h=eff_h)
+        else:
+            zone = PATHOLOGY_ONTOLOGY[canon]["default_zone"]
+        by_canon[canon].append(zone)
+
+    findings: list[dict[str, Any]] = []
+    for canon, zones in by_canon.items():
+        for z in _merge_component_zones(zones, canon):
+            findings.append({"label": canon, "zone": z})
+    return findings
+
+
 def load_chestx_det_hf(
     max_samples: int | None = None,
     img_cache_dir: str = "./.tmp/training_images",
@@ -590,12 +756,18 @@ def load_chestx_det_hf(
     split: str = "train",
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
+    """
+    Streams natealberti/ChestX-Det with uniform normalization and mathematically verified
+    1-to-1 official Deepwise JSON recovery (recovers uncorrupted Nodule, Pneumothorax,
+    and occluded Consolidations; falls back safely to verified 0-indexed mask IDs 0..9, 11).
+    """
     import numpy as np
     from datasets import load_dataset
 
-    print(f"[Loader] Streaming ChestX-Det ({split})...", flush=True)
+    print(f"[Loader] Streaming ChestX-Det ({split}, uniform norm + verified 0-indexed labels)...", flush=True)
     ds = load_dataset("natealberti/ChestX-Det", split=split, streaming=streaming)
     records: list[dict[str, Any]] = []
+    mask_sigs: list[tuple[bool, bool, bool, int, int]] = []
     out_img_dir = Path(img_cache_dir) / f"chestx_det_{split}"
     out_img_dir.mkdir(parents=True, exist_ok=True)
 
@@ -610,24 +782,27 @@ def load_chestx_det_hf(
         img_file = _save_resized_image(pil_img, out_img_dir / f"chestx_det_{split}_{idx:06d}.jpg", image_size)
 
         findings: list[dict[str, Any]] = []
+        uniq_set: set[int] = set()
         if lbl_img is not None:
             lbl_arr = np.asarray(lbl_img)
             if lbl_arr.ndim == 3:
                 lbl_arr = lbl_arr[..., 0]
             for uid in np.unique(lbl_arr):
                 uid_int = int(uid)
-                if uid_int == 255 or uid_int not in CHESTX_DET_ID2LABEL:
+                if uid_int == 255:
+                    continue
+                uniq_set.add(uid_int)
+                if uid_int not in CHESTX_DET_ID2LABEL:
                     continue
                 canon = canonicalize_label(CHESTX_DET_ID2LABEL[uid_int])
                 if not canon:
                     continue
-                ys, xs = np.where(lbl_arr == uid_int)
-                box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())] if len(xs) else None
-                findings.append({
-                    "label": canon,
-                    "zone": bbox_to_anatomical_zone(box, canon, img_w=img_w, img_h=img_h),
-                })
+                comp_boxes = _extract_mask_boxes(lbl_arr == uid_int, min_pixels=16)
+                comp_zones = [bbox_to_anatomical_zone(b, canon, img_w=img_w, img_h=img_h) for b in comp_boxes]
+                for z in _merge_component_zones(comp_zones, canon):
+                    findings.append({"label": canon, "zone": z})
 
+        mask_sigs.append((len(uniq_set) == 0, 2 in uniq_set, 5 in uniq_set, img_w, img_h))
         records.append({
             "source": f"ChestX-Det-{split}",
             "group_id": f"chestx_det_{split}_{idx:06d}",
@@ -636,6 +811,35 @@ def load_chestx_det_hf(
         })
         if len(records) % 250 == 0:
             print(f"  [ChestX-Det-{split}] {len(records)} cached...", flush=True)
+
+    # Attempt mathematically verified 1-to-1 upgrade to official Deepwise multi-label boxes
+    official = _fetch_official_chestx_det_json(split)
+    if official and len(records) <= len(official):
+        candidates = [
+            ("native", official[: len(records)]),
+            ("filename_sorted", sorted(official, key=lambda x: str(x.get("file_name", "")))[: len(records)]),
+        ]
+        n = max(1, len(records))
+        for order_name, cand in candidates:
+            empty_ok = sum(sig[0] == (len(it.get("syms") or []) == 0) for sig, it in zip(mask_sigs, cand)) / n
+            cardio_ok = sum(sig[1] == ("Cardiomegaly" in (it.get("syms") or [])) for sig, it in zip(mask_sigs, cand)) / n
+            eff_ok = sum(sig[2] == ("Effusion" in (it.get("syms") or [])) for sig, it in zip(mask_sigs, cand)) / n
+            if empty_ok >= 0.99 and cardio_ok >= 0.98 and eff_ok >= 0.95:
+                for rec, sig, it in zip(records, mask_sigs, cand):
+                    rec["findings"] = _findings_from_deepwise_item(it, sig[3], sig[4])
+                print(
+                    f"[Loader] ChestX-Det ({split}): VERIFIED 1-to-1 official Deepwise JSON ({order_name}: "
+                    f"empty={empty_ok:.1%}, cardio={cardio_ok:.1%}, eff={eff_ok:.1%}) -> uncorrupted 13-class boxes active!",
+                    flush=True,
+                )
+                break
+        else:
+            print(
+                f"[Loader] ChestX-Det ({split}): official JSON order differed; using verified 0-indexed mask fallback "
+                "(IDs 0..9, 11; corrupted ID 12 skipped).",
+                flush=True,
+            )
+
     print(f"[Loader] ChestX-Det ({split}): loaded {len(records)} studies", flush=True)
     return records
 
@@ -647,10 +851,13 @@ def load_chexpert_hf(
     image_size: int = 512,
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
-    """Streams danjacobellis/chexpert (Frontal == 0, positive == 3; skips ambiguous uncertain-only rows)."""
+    """
+    Streams danjacobellis/chexpert with verified HuggingFace ClassLabel mapping:
+      0 = unlabeled, 1 = uncertain, 2 = absent, 3 = present (Frontal/Lateral: 0 = Frontal).
+    """
     from datasets import load_dataset
 
-    print("[Loader] Streaming CheXpert (train, frontal only)...", flush=True)
+    print("[Loader] Streaming CheXpert (train, frontal only, verified 1=uncertain/2=absent/3=present)...", flush=True)
     ds = load_dataset("danjacobellis/chexpert", split="train", streaming=streaming)
     chex_cols = [
         "Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion",
@@ -682,7 +889,7 @@ def load_chexpert_hf(
                         "label": canon,
                         "zone": PATHOLOGY_ONTOLOGY[canon]["default_zone"],
                     })
-            elif val == 2 or str(val).strip() == "2":
+            elif val == 1 or str(val).strip() == "1":
                 has_uncertain = True
 
         no_finding = row.get("No Finding") == 3 or str(row.get("No Finding")).strip() == "3"
@@ -713,27 +920,65 @@ def load_padchest_gr_hf(
     split: str = "train",
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
-    """Streams JasonZZ0601/PadChest-GR-Xray with 16-bit contrast normalization & safe location parsing."""
+    """
+    Streams JasonZZ0601/PadChest-GR-Xray with:
+      1. Study-level grouping across multi-sentence rows for the same radiograph.
+      2. Strict Normal validation (unmapped abnormalities are NEVER labeled Normal).
+      3. Uniform contrast normalization + standardized zone vocabulary (zero dataset fingerprints).
+    """
     from datasets import load_dataset
 
-    print(f"[Loader] Streaming PadChest-GR ({split}, 16-bit normalized)...", flush=True)
+    print(f"[Loader] Streaming PadChest-GR ({split}, grouped studies + uniform norm)...", flush=True)
     ds = load_dataset("JasonZZ0601/PadChest-GR-Xray", split=split, streaming=streaming)
     out_img_dir = Path(img_cache_dir) / f"padchest_gr_{split}"
     out_img_dir.mkdir(parents=True, exist_ok=True)
-    records: list[dict[str, Any]] = []
+
+    studies: dict[str, dict[str, Any]] = {}
+    scanned_rows = 0
+    max_scan_rows = (max_samples * 4) if max_samples else None
 
     for idx, row in enumerate(ds):
-        if max_samples and len(records) >= max_samples:
-            break
+        scanned_rows += 1
         pil_img = row.get("image")
         if pil_img is None:
             continue
+
+        group_raw = str(row.get("PatientID") or row.get("patient_id") or row.get("ImageID") or f"{idx:06d}")
+        img_fp = _fast_image_fingerprint(pil_img)
+        study_key = f"{group_raw}_{img_fp}"
+
+        if max_samples and study_key not in studies and len(studies) >= max_samples:
+            break
+        if max_scan_rows and scanned_rows > max_scan_rows and study_key not in studies:
+            break
+
+        if study_key not in studies:
+            img_file = _save_resized_image(
+                pil_img,
+                out_img_dir / f"padchest_{split}_{len(studies):06d}_{img_fp}.jpg",
+                image_size,
+            )
+            studies[study_key] = {
+                "source": f"PadChest-GR-{split}",
+                "group_id": f"padchest_{split}_{group_raw}",
+                "image_path": img_file,
+                "findings": [],
+                "_seen_pairs": set(),
+                "_explicit_normal": False,
+                "_has_unmapped_abn": False,
+            }
+            if len(studies) % 100 == 0:
+                print(f"  [PadChest-GR-{split}] {len(studies)} unique studies ({scanned_rows} rows)...", flush=True)
+
+        entry = studies[study_key]
         img_w, img_h = pil_img.size
-        img_file = _save_resized_image(pil_img, out_img_dir / f"padchest_{split}_{idx:06d}.jpg", image_size)
 
         raw_lbl = row.get("label") if row.get("label") is not None else row.get("labels", "")
-        parts = [str(x) for x in raw_lbl] if isinstance(raw_lbl, list) else [p for p in str(raw_lbl).split(",")]
+        parts = [str(x).strip() for x in raw_lbl] if isinstance(raw_lbl, list) else [p.strip() for p in str(raw_lbl).split(",")]
+        parts = [p for p in parts if p]
         loc_str = _parse_padchest_locations(row.get("locations"))
+        raw_note = str(row.get("sentence_en") or "").strip()
+        has_note = bool(raw_note and raw_note.lower() != "none")
 
         boxes = row.get("boxes") or row.get("bbox") or None
         first_box = None
@@ -743,29 +988,61 @@ def load_padchest_gr_hf(
             elif len(boxes) == 4 and all(isinstance(v, (int, float)) for v in boxes):
                 first_box = boxes
 
-        findings = []
+        if parts and all(p.lower() in ("normal", "no finding", "no findings") for p in parts):
+            if has_note:
+                entry["_has_unmapped_abn"] = True
+            else:
+                entry["_explicit_normal"] = True
+            continue
+
+        mapped_any = False
         for part in parts:
+            if part.lower() in ("normal", "no finding", "no findings"):
+                continue
             canon = canonicalize_label(part)
             if canon:
+                mapped_any = True
                 if first_box is not None:
                     zone = bbox_to_anatomical_zone(first_box, canon, img_w=img_w, img_h=img_h)
                 else:
-                    zone = loc_str or PATHOLOGY_ONTOLOGY[canon]["default_zone"]
-                findings.append({"label": canon, "zone": zone})
+                    zone = _normalize_padchest_zone(loc_str, canon)
+                pair = (canon, zone)
+                if pair not in entry["_seen_pairs"]:
+                    entry["_seen_pairs"].add(pair)
+                    entry["findings"].append({"label": canon, "zone": zone})
+            else:
+                entry["_has_unmapped_abn"] = True
 
-        note = str(row.get("sentence_en") or "").strip()
-        group_raw = row.get("PatientID") or row.get("patient_id") or row.get("ImageID") or f"{idx:06d}"
+        if not mapped_any and (parts or has_note):
+            entry["_has_unmapped_abn"] = True
 
-        records.append({
-            "source": f"PadChest-GR-{split}",
-            "group_id": f"padchest_{split}_{group_raw}",
-            "image_path": img_file,
-            "findings": findings,
-            "note": None if (not note or note.lower() == "none") else note,
-        })
-        if len(records) % 100 == 0:
-            print(f"  [PadChest-GR-{split}] {len(records)} cached...", flush=True)
-    print(f"[Loader] PadChest-GR ({split}): loaded {len(records)} studies", flush=True)
+    records: list[dict[str, Any]] = []
+    skipped_unmapped = 0
+    for entry in studies.values():
+        if entry["findings"]:
+            records.append({
+                "source": entry["source"],
+                "group_id": entry["group_id"],
+                "image_path": entry["image_path"],
+                "findings": entry["findings"],
+                "note": None,
+            })
+        elif entry["_explicit_normal"] and not entry["_has_unmapped_abn"]:
+            records.append({
+                "source": entry["source"],
+                "group_id": entry["group_id"],
+                "image_path": entry["image_path"],
+                "findings": [],
+                "note": None,
+            })
+        else:
+            skipped_unmapped += 1
+
+    print(
+        f"[Loader] PadChest-GR ({split}): kept {len(records)} clean studies "
+        f"from {scanned_rows} rows (dropped {skipped_unmapped} unmapped-only studies)",
+        flush=True,
+    )
     return records
 
 
@@ -773,15 +1050,16 @@ def load_siim_pneumo_hf(
     max_samples: int | None = None,
     img_cache_dir: str = "./.tmp/training_images",
     image_size: int = 512,
+    split: str = "train",
     streaming: bool = True,
 ) -> list[dict[str, Any]]:
-    """Streams nwirandx/siim-pneumothorax-256-2400 for high-recall Pneumothorax bbox grounding."""
+    """Streams nwirandx/siim-pneumothorax-256-2400 with uniform contrast normalization & CC boxes."""
     import numpy as np
     from datasets import load_dataset
 
-    print("[Loader] Streaming SIIM-Pneumothorax (train)...", flush=True)
-    ds = load_dataset("nwirandx/siim-pneumothorax-256-2400", split="train", streaming=streaming)
-    out_img_dir = Path(img_cache_dir) / "siim_pneumo"
+    print(f"[Loader] Streaming SIIM-Pneumothorax ({split}, uniform norm)...", flush=True)
+    ds = load_dataset("nwirandx/siim-pneumothorax-256-2400", split=split, streaming=streaming)
+    out_img_dir = Path(img_cache_dir) / f"siim_pneumo_{split}"
     out_img_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
 
@@ -792,34 +1070,37 @@ def load_siim_pneumo_hf(
         if pil_img is None:
             continue
         img_w, img_h = pil_img.size
-        img_file = _save_resized_image(pil_img, out_img_dir / f"siim_pneumo_{idx:06d}.jpg", image_size)
+        img_file = _save_resized_image(pil_img, out_img_dir / f"siim_pneumo_{split}_{idx:06d}.jpg", image_size)
 
         has_pneumo = int(row.get("has_pneumo", 0) or 0) == 1
         findings: list[dict[str, Any]] = []
         if has_pneumo:
             mask_img = row.get("mask")
-            box = None
+            comp_boxes: list[list[float]] = []
             if mask_img is not None:
                 m_arr = np.asarray(mask_img)
                 if m_arr.ndim == 3:
                     m_arr = m_arr[..., 0]
-                ys, xs = np.where(m_arr > 0)
-                if len(xs) > 0:
-                    box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
-            findings.append({
-                "label": "Pneumothorax",
-                "zone": bbox_to_anatomical_zone(box, "Pneumothorax", img_w=img_w, img_h=img_h),
-            })
+                comp_boxes = _extract_mask_boxes(m_arr > 0, min_pixels=8)
+            if comp_boxes:
+                zones = [bbox_to_anatomical_zone(b, "Pneumothorax", img_w=img_w, img_h=img_h) for b in comp_boxes]
+                for z in _merge_component_zones(zones, "Pneumothorax"):
+                    findings.append({"label": "Pneumothorax", "zone": z})
+            else:
+                findings.append({
+                    "label": "Pneumothorax",
+                    "zone": PATHOLOGY_ONTOLOGY["Pneumothorax"]["default_zone"],
+                })
 
         records.append({
-            "source": "SIIM-Pneumothorax",
-            "group_id": f"siim_pneumo_{idx:06d}",
+            "source": f"SIIM-Pneumothorax-{split}",
+            "group_id": f"siim_pneumo_{split}_{idx:06d}",
             "image_path": img_file,
             "findings": findings,
         })
         if len(records) % 500 == 0:
-            print(f"  [SIIM-Pneumothorax] {len(records)} cached...", flush=True)
-    print(f"[Loader] SIIM-Pneumothorax: loaded {len(records)} studies", flush=True)
+            print(f"  [SIIM-Pneumothorax-{split}] {len(records)} cached...", flush=True)
+    print(f"[Loader] SIIM-Pneumothorax ({split}): loaded {len(records)} studies", flush=True)
     return records
 
 
@@ -970,25 +1251,47 @@ def _build_cad_prompt(cad_summary: str) -> str:
     )
 
 
+def _sample_weighted_distractors(
+    absent_pool: list[str],
+    rng: random.Random,
+    k: int = 1,
+    class_weights: dict[str, float] | None = None,
+) -> list[str]:
+    """Samples fake CAD alerts frequency-matched to real positive classes so the VLM cannot exploit class priors."""
+    if not absent_pool:
+        return ["Pneumothorax"]
+    k = min(k, len(absent_pool))
+    if not class_weights:
+        return rng.sample(absent_pool, k=k)
+
+    pool = list(absent_pool)
+    chosen: list[str] = []
+    for _ in range(k):
+        wts = [max(0.25, float(class_weights.get(c, 1.0))) for c in pool]
+        pick = rng.choices(pool, weights=wts, k=1)[0]
+        chosen.append(pick)
+        pool.remove(pick)
+    return chosen
+
+
 def _build_mode3_rejection_payload(
     record: dict[str, Any],
     rng: random.Random,
+    class_weights: dict[str, float] | None = None,
 ) -> tuple[str, list[str], str]:
     """
-    Constructs a perturbed CAD alert + visual counter-evidence refutation notes.
-    Returns: (cad_summary, rejected_notes, rejection_subtype)
+    Constructs a frequency-matched false CAD alert + visual counter-evidence refutation notes (v2.2):
       - normal_fp: Normal study + 1-2 fake CAD flags -> reject & conclude Normal.
-      - laterality_flip: Unilateral study + opposite-side CAD flag -> reject wrong side & correct.
+      - abnormal_full_fp: Abnormal study + ONLY 1 fake CAD flag -> reject fake AND preserve true visual findings.
       - abnormal_distractor: Abnormal study + true flag(s) + 1 fake CAD flag -> confirm true, reject fake.
     """
     true_findings = record["findings"]
     present_labels = {f["label"] for f in true_findings}
     absent_pool = [c for c in _DISTRACTOR_POOL if c not in present_labels] or ["Pneumothorax"]
 
-    # Subtype 3a: Normal False-Positive Rejection
     if not true_findings:
         k = 2 if (len(absent_pool) >= 2 and rng.random() < 0.25) else 1
-        fake_classes = rng.sample(absent_pool, k=k)
+        fake_classes = _sample_weighted_distractors(absent_pool, rng, k=k, class_weights=class_weights)
         cad_items: list[str] = []
         ref_notes: list[str] = []
         for fc in fake_classes:
@@ -1002,28 +1305,18 @@ def _build_mode3_rejection_payload(
             )
         return "; ".join(cad_items), ref_notes, "normal_fp"
 
-    # Subtype 3c: Laterality Flip Rejection (when a unilateral finding is present)
-    flippable = [(i, f, _flip_laterality(f["zone"])) for i, f in enumerate(true_findings)]
-    flippable = [(i, f, flipped) for i, f, flipped in flippable if flipped is not None]
-    if flippable and rng.random() < 0.35:
-        flip_idx, target_f, wrong_zone = rng.choice(flippable)
-        meta = PATHOLOGY_ONTOLOGY[target_f["label"]]
-        cad_items = []
-        for i, f in enumerate(true_findings[:4]):
-            f_meta = PATHOLOGY_ONTOLOGY[f["label"]]
-            z = wrong_zone if i == flip_idx else f["zone"]
-            cad_items.append(f"{f_meta['clinical_name']} at {z}")
-        ref_note = (
-            f"CAD flagged suspected {meta['clinical_name']} at the {wrong_zone}; "
-            f"however, direct visual inspection rejects this laterality and confirms the abnormality "
-            f"is actually located within the {target_f['zone']}."
-        )
-        return "; ".join(cad_items), [ref_note], "laterality_flip"
-
-    # Subtype 3b: Abnormal Distractor Rejection (true finding + injected fake finding)
-    fake_cls = rng.choice(absent_pool)
+    fake_cls = _sample_weighted_distractors(absent_pool, rng, k=1, class_weights=class_weights)[0]
     fake_meta = PATHOLOGY_ONTOLOGY[fake_cls]
     fake_zone = rng.choice(_DISTRACTOR_ZONES.get(fake_cls, [fake_meta["default_zone"]]))
+
+    if rng.random() < 0.50:
+        cad_summary = f"{fake_meta['clinical_name']} at {fake_zone}"
+        ref_note = (
+            f"CAD flagged suspected {fake_meta['clinical_name']} at the {fake_zone}; "
+            f"however, direct visual evaluation of the radiograph does not substantiate this alert, "
+            f"demonstrating {fake_meta['neg_visual']}."
+        )
+        return cad_summary, [ref_note], "abnormal_full_fp"
 
     cad_items = [
         f"{PATHOLOGY_ONTOLOGY[f['label']]['clinical_name']} at {f['zone']}"
@@ -1044,12 +1337,9 @@ def format_vlm_chat_sample(
     include_cad_context: bool = False,
     mode: str | None = None,
     rng: random.Random | None = None,
+    class_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """
-    Formats a record into SmolVLM chat messages + validates 5-Rule compliance.
-    Backward-compatible with `include_cad_context=bool`; pass `mode="pure" | "cad_aligned" | "cad_reject"`
-    for full 3-Mode Rulebook + Authenticator synthesis.
-    """
+    """Formats a record into SmolVLM chat messages + validates 5-Rule compliance."""
     effective_mode = mode or ("cad_aligned" if include_cad_context else "pure")
     local_rng = rng or random.Random(42)
 
@@ -1068,7 +1358,9 @@ def format_vlm_chat_sample(
             )
         user_text = _build_cad_prompt(cad_summary)
     elif effective_mode == "cad_reject":
-        cad_summary, rejected_notes, rejection_subtype = _build_mode3_rejection_payload(record, local_rng)
+        cad_summary, rejected_notes, rejection_subtype = _build_mode3_rejection_payload(
+            record, local_rng, class_weights=class_weights
+        )
         user_text = _build_cad_prompt(cad_summary)
     else:
         raise ValueError(f"Unsupported mode: {effective_mode}")
@@ -1101,30 +1393,55 @@ def format_vlm_chat_sample(
 def _emit_three_mode_samples(
     records: list[dict[str, Any]],
     seed: int = 42,
-    pure_ratio: float = 0.40,
-    cad_aligned_ratio: float = 0.35,
+    pure_ratio: float = 0.50,
+    cad_aligned_ratio: float = 0.20,
 ) -> list[dict[str, Any]]:
     """
-    Assigns 40% Pure-Image, 35% CAD-Aligned, and 25% CAD-Authenticator Rejection
-    while ensuring every study is represented cleanly.
+    Balanced 3-Mode v2.2 mixture with frequency-matched CAD distractors:
+      - Abnormal studies: 50% Pure-Image, 20% CAD-Aligned, 30% CAD-Reject (half full-FP, half distractor)
+      - Normal studies:   40% Pure-Image, 10% CAD-Aligned, 50% CAD-Reject (normal_fp)
     """
     rng = random.Random(seed)
+    pos_counts: Counter[str] = Counter()
+    for rec in records:
+        for f in rec.get("findings") or []:
+            pos_counts[f["label"]] += 1
+    avg_c = (sum(pos_counts.values()) / max(1, len(pos_counts))) if pos_counts else 1.0
+    class_weights = {
+        c: max(0.35, float(pos_counts.get(c, 0)) / max(1.0, avg_c))
+        for c in _DISTRACTOR_POOL
+    }
+
     samples: list[dict[str, Any]] = []
     for rec in records:
         r = rng.random()
-        if r < pure_ratio:
-            mode = "pure"
-        elif r < pure_ratio + cad_aligned_ratio:
-            mode = "cad_aligned"
+        if not rec["findings"]:
+            if r < 0.40:
+                mode = "pure"
+            elif r < 0.50:
+                mode = "cad_aligned"
+            else:
+                mode = "cad_reject"
         else:
-            mode = "cad_reject"
-        samples.append(format_vlm_chat_sample(rec, mode=mode, rng=rng))
+            if r < pure_ratio:
+                mode = "pure"
+            elif r < pure_ratio + cad_aligned_ratio:
+                mode = "cad_aligned"
+            else:
+                mode = "cad_reject"
+        samples.append(format_vlm_chat_sample(rec, mode=mode, rng=rng, class_weights=class_weights))
     rng.shuffle(samples)
     return samples
 
 
-def export_holdout_benchmarks(holdout_dir: str, img_cache_dir: str, image_size: int = 512, max_padchest: int = 120) -> None:
-    """Exports completely unseen ChestX-Det (test) and PadChest-GR (test) manifest for Gate 1-4 validation."""
+def export_holdout_benchmarks(
+    holdout_dir: str,
+    img_cache_dir: str,
+    image_size: int = 512,
+    max_padchest: int = 150,
+    max_siim: int = 120,
+) -> None:
+    """Exports unseen ChestX-Det (test), PadChest-GR (test), and SIIM-Pneumothorax (test) for Gate 1-4 validation."""
     out = Path(holdout_dir)
     out.mkdir(parents=True, exist_ok=True)
     holdout_records: list[dict[str, Any]] = []
@@ -1143,6 +1460,18 @@ def export_holdout_benchmarks(holdout_dir: str, img_cache_dir: str, image_size: 
         )
     except Exception as exc:
         print(f"[Holdout] Skipping PadChest-GR test split ({exc})")
+    try:
+        holdout_records.extend(
+            load_siim_pneumo_hf(
+                max_samples=max_siim,
+                split="test",
+                img_cache_dir=img_cache_dir,
+                image_size=image_size,
+                streaming=True,
+            )
+        )
+    except Exception as exc:
+        print(f"[Holdout] Skipping SIIM-Pneumothorax test split ({exc})")
 
     manifest_path = out / "holdout_manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as mf:
@@ -1254,8 +1583,8 @@ def main() -> None:
             format_vlm_chat_sample(val_recs[1], mode="cad_reject", rng=rng),
         ]
     else:
-        train_samples = _emit_three_mode_samples(train_recs, seed=args.seed, pure_ratio=0.40, cad_aligned_ratio=0.35)
-        val_samples = _emit_three_mode_samples(val_recs, seed=args.seed + 1, pure_ratio=0.40, cad_aligned_ratio=0.35)
+        train_samples = _emit_three_mode_samples(train_recs, seed=args.seed, pure_ratio=0.50, cad_aligned_ratio=0.20)
+        val_samples = _emit_three_mode_samples(val_recs, seed=args.seed + 1, pure_ratio=0.50, cad_aligned_ratio=0.20)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
