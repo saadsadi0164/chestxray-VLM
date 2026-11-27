@@ -131,6 +131,7 @@ class TestV22Upgrades(unittest.TestCase):
         total_loss, diag_loss, aux_loss, aux_logits = compute_multitask_loss(
             model, batch, vis_hook=hook, aux_head=aux_head, aux_loss_weight=0.5
         )
+        self.assertIsNone(hook.captured)
         self.assertIsNotNone(aux_logits)
         self.assertTrue(torch.isfinite(total_loss))
         self.assertTrue(torch.isfinite(aux_loss))

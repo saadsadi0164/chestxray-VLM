@@ -191,6 +191,86 @@ def run_authenticator_fp_check(
     }
 
 
+def _select_stratified_samples(
+    manifest: list[dict[str, Any]],
+    max_samples: int,
+) -> list[dict[str, Any]]:
+    """
+    Stratifies holdout evaluation when `max_samples > 0` across ChestX-Det abnormals,
+    PadChest-GR abnormals, Normal controls, and up to 20 unseen abnormal SIIM-Pneumothorax
+    studies (when present), preserving backward compatibility when SIIM is absent.
+    """
+    if max_samples <= 0 or len(manifest) <= max_samples:
+        return manifest
+
+    siim_abn: list[dict[str, Any]] = []
+    chestx_abn: list[dict[str, Any]] = []
+    padchest_abn: list[dict[str, Any]] = []
+    normals: list[dict[str, Any]] = []
+    others: list[dict[str, Any]] = []
+
+    for item in manifest:
+        ds_low = item["dataset"].lower()
+        is_norm = item["gt_buckets"] == ["normal"]
+        if is_norm:
+            normals.append(item)
+        elif "siim" in ds_low:
+            siim_abn.append(item)
+        elif "chestx-det" in ds_low or "chestx_det" in ds_low:
+            chestx_abn.append(item)
+        elif "padchest" in ds_low:
+            padchest_abn.append(item)
+        else:
+            others.append(item)
+
+    # Reserve up to 20 unseen abnormal SIIM-Pneumothorax studies when present
+    siim_quota = min(20, len(siim_abn), max(1, max_samples // 4)) if (siim_abn and max_samples >= 4) else 0
+    selected: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    def _take(pool: list[dict[str, Any]], limit: int) -> None:
+        for entry in pool:
+            if len(selected) >= max_samples or limit <= 0:
+                break
+            eid = id(entry)
+            if eid not in seen_ids:
+                seen_ids.add(eid)
+                selected.append(entry)
+                limit -= 1
+
+    if siim_quota > 0:
+        _take(siim_abn, siim_quota)
+
+    remaining = max_samples - len(selected)
+    norm_quota = min(len(normals), max(1, remaining // 4)) if (normals and remaining >= 4) else 0
+    _take(normals, norm_quota)
+
+    # Interleave remaining abnormal pools (ChestX-Det, PadChest-GR, Others) round-robin
+    abn_pools = [p for p in (chestx_abn, padchest_abn, others) if p]
+    ptrs = [0] * len(abn_pools)
+    while len(selected) < max_samples:
+        progressed = False
+        for p_idx, pool in enumerate(abn_pools):
+            if len(selected) >= max_samples:
+                break
+            while ptrs[p_idx] < len(pool) and id(pool[ptrs[p_idx]]) in seen_ids:
+                ptrs[p_idx] += 1
+            if ptrs[p_idx] < len(pool):
+                entry = pool[ptrs[p_idx]]
+                ptrs[p_idx] += 1
+                seen_ids.add(id(entry))
+                selected.append(entry)
+                progressed = True
+        if not progressed:
+            break
+
+    # Top up with any leftover SIIM or Normal items if budget remains
+    for leftover in (siim_abn, normals):
+        _take(leftover, max_samples - len(selected))
+
+    return selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Pure VLM, CAD-Authenticator & Audited Hybrid.")
     parser.add_argument("--manifest", default="./.tmp/virtual_test_suite/manifest.json")
@@ -204,10 +284,9 @@ def main() -> None:
     with open(args.manifest, encoding="utf-8") as f:
         raw_manifest = json.load(f)
 
-    if args.max_samples > 0:
-        raw_manifest = raw_manifest[: args.max_samples]
-
     manifest = [_normalize_manifest_item(i, item) for i, item in enumerate(raw_manifest, start=1)]
+    if args.max_samples > 0:
+        manifest = _select_stratified_samples(manifest, args.max_samples)
     pipeline = ChestXRayPipeline(adapter_path=args.adapter, load_cad=not args.skip_cad, use_lora=True)
 
     results: list[dict[str, Any]] = []

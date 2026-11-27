@@ -496,6 +496,10 @@ def compute_multitask_loss(
     outputs = model(**model_inputs)
     logits = outputs.logits
 
+    captured = vis_hook.captured if vis_hook is not None else None
+    if vis_hook is not None:
+        vis_hook.clear()
+
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
 
@@ -525,19 +529,21 @@ def compute_multitask_loss(
     aux_logits: torch.Tensor | None = None
     if (
         aux_loss_weight > 0.0
-        and vis_hook is not None
         and aux_head is not None
         and aux_targets is not None
-        and vis_hook.captured is not None
+        and captured is not None
     ):
         bsz = int(labels.shape[0])
-        vis_emb = vis_hook.captured.reshape(bsz, -1, vis_hook.captured.shape[-1]).float().mean(dim=1)
-        aux_logits = aux_head(vis_emb)
-        aux_loss = F.binary_cross_entropy_with_logits(
-            aux_logits,
-            aux_targets.float(),
-            pos_weight=aux_pos_weight,
-        )
+        fp32_ctx = torch.amp.autocast(device_type="cuda", enabled=False) if lm_loss.is_cuda else contextlib.nullcontext()
+        with fp32_ctx:
+            vis_emb = captured.reshape(bsz, -1, captured.shape[-1]).float().mean(dim=1)
+            aux_logits = aux_head(vis_emb)
+            pos_w = aux_pos_weight.float() if aux_pos_weight is not None else None
+            aux_loss = F.binary_cross_entropy_with_logits(
+                aux_logits.float(),
+                aux_targets.float(),
+                pos_weight=pos_w,
+            )
         total_loss = lm_loss + aux_loss_weight * aux_loss
     else:
         total_loss = lm_loss
@@ -594,6 +600,9 @@ def compute_validation_metrics(
             tp += (preds * targs).sum(dim=0)
             fp += (preds * (1.0 - targs)).sum(dim=0)
             fn += ((1.0 - preds) * targs).sum(dim=0)
+
+    if vis_hook is not None:
+        vis_hook.clear()
 
     model.train()
     if aux_head is not None:
