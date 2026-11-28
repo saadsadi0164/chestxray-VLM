@@ -31,6 +31,7 @@ from execution.ensemble_cad import (
     load_multi_resolution_ensemble,
     resolve_cnn_device,
 )
+from execution.preprocess import normalize_cxr_to_rgb
 
 DEFAULT_BASE_MODEL = "HuggingFaceTB/SmolVLM-500M-Instruct"
 DEFAULT_ADAPTER_PATH = "./chestxray_smolvlm_lora"
@@ -99,16 +100,30 @@ _SECTION_HEADER_RE = re.compile(
 )
 
 
-def resolve_llm_device(preferred: str = "auto") -> tuple[str, torch.dtype]:
-    """Selects optimal device and safe dtype (float16 on MPS/CUDA, float32 on CPU)."""
+def resolve_llm_device(
+    preferred: str = "auto",
+    allow_mps_bf16: bool = False,
+) -> tuple[str, torch.dtype]:
+    """
+    Selects optimal device and safe dtype.
+    Apple Silicon MPS defaults strictly to float32 to prevent float16/bfloat16
+    logit instability; bfloat16 on MPS requires explicit `allow_mps_bf16=True`.
+    """
     if preferred == "auto":
         if torch.backends.mps.is_available():
-            return "mps", torch.float16
-        if torch.cuda.is_available():
-            return "cuda", torch.float16
-        return "cpu", torch.float32
-    dtype = torch.float16 if preferred in ("mps", "cuda") else torch.float32
-    return preferred, dtype
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+    else:
+        device = preferred
+
+    if device == "mps":
+        return device, (torch.bfloat16 if allow_mps_bf16 else torch.float32)
+    if device == "cuda":
+        return device, torch.float16
+    return device, torch.float32
 
 
 def _load_hf_with_offline_fallback(loader_fn, model_id: str, **kwargs):
@@ -298,6 +313,7 @@ class ChestXRayPipeline:
         load_cad: bool = True,
         cnn_device: str = "auto",
         llm_device: str = "auto",
+        allow_mps_bf16: bool = False,
     ):
         self.base_model_id = base_model_id
         self.adapter_path = adapter_path
@@ -305,7 +321,7 @@ class ChestXRayPipeline:
         self.is_rulebook_v2 = os.path.isfile(os.path.join(adapter_path, "rulebook_v2.json"))
 
         self.cnn_device = resolve_cnn_device(cnn_device)
-        self.llm_device, self.llm_dtype = resolve_llm_device(llm_device)
+        self.llm_device, self.llm_dtype = resolve_llm_device(llm_device, allow_mps_bf16=allow_mps_bf16)
 
         self.ensemble_224: list[dict[str, Any]] = []
         self.resnet_512: dict[str, Any] | None = None
@@ -345,17 +361,12 @@ class ChestXRayPipeline:
         self.llm_model.eval()
         print("[VLM Engine] SmolVLM ready.")
 
-    def _generate_vlm_text(
+    def _build_vlm_inputs(
         self,
-        image: Image.Image,
+        image: Image.Image | str | os.PathLike[str],
         user_prompt: str,
-        max_new_tokens: int = 384,
-    ) -> str:
-        if self.is_rulebook_v2:
-            from execution.build_rulebook_dataset import normalize_cxr_to_rgb
-            image_rgb = normalize_cxr_to_rgb(image, image_size=512)
-        else:
-            image_rgb = image.convert("RGB").resize((512, 512))
+    ) -> dict[str, torch.Tensor]:
+        image_rgb = normalize_cxr_to_rgb(image, image_size=512)
         if self.is_rulebook_v2 or not self.use_lora:
             messages = [
                 {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK}]},
@@ -378,27 +389,55 @@ class ChestXRayPipeline:
             tokenize=False,
         )
         inputs = self.processor(text=[prompt], images=[[image_rgb]], return_tensors="pt")
-        inputs = {
+        return {
             k: v.to(device=self.llm_device, dtype=self.llm_dtype) if v.is_floating_point() else v.to(device=self.llm_device)
             for k, v in inputs.items()
         }
 
+    def _run_vlm_generate(
+        self,
+        image: Image.Image | str | os.PathLike[str],
+        user_prompt: str,
+        max_new_tokens: int = 384,
+        return_scores: bool = False,
+    ) -> tuple[str, tuple[torch.Tensor, ...] | None]:
+        inputs = self._build_vlm_inputs(image, user_prompt)
         input_len = inputs["input_ids"].shape[1]
         with torch.no_grad():
-            output_ids = self.llm_model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                repetition_penalty=1.08 if self.is_rulebook_v2 else 1.15,
-            )
-        decoded = self.processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
+            gen_kwargs: dict[str, Any] = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": False,
+                "repetition_penalty": 1.08 if self.is_rulebook_v2 else 1.15,
+            }
+            if return_scores:
+                gen_kwargs["output_scores"] = True
+                gen_kwargs["return_dict_in_generate"] = True
+            out = self.llm_model.generate(**inputs, **gen_kwargs)
 
-        del inputs, output_ids
+        if return_scores:
+            seq = out.sequences[0]
+            scores = tuple(s.detach().cpu() for s in (out.scores or ()))
+        else:
+            seq = out[0]
+            scores = None
+
+        decoded = self.processor.decode(seq[input_len:], skip_special_tokens=True).strip()
+
+        del inputs, out
         gc.collect()
         if self.llm_device == "mps":
             torch.mps.empty_cache()
         elif self.llm_device == "cuda":
             torch.cuda.empty_cache()
+        return decoded, scores
+
+    def _generate_vlm_text(
+        self,
+        image: Image.Image | str | os.PathLike[str],
+        user_prompt: str,
+        max_new_tokens: int = 384,
+    ) -> str:
+        decoded, _ = self._run_vlm_generate(image, user_prompt, max_new_tokens=max_new_tokens, return_scores=False)
         return decoded
 
     def analyze(

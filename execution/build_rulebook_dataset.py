@@ -36,6 +36,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from execution.analyze_xray import SYSTEM_RULEBOOK
+from execution.preprocess import normalize_cxr_to_rgb
 
 # =====================================================================
 # 1. UNIFIED THORACIC PATHOLOGY & OBSERVATION ONTOLOGY (25 ETIOLOGIES)
@@ -530,34 +531,7 @@ CHESTX_DET_ID2LABEL: dict[int, str] = {
 }
 
 
-def normalize_cxr_to_rgb(pil_img: Any, image_size: int = 512) -> Any:
-    """
-    Uniform 1st-99th percentile grayscale contrast normalization across ALL datasets
-    (8-bit, 16-bit, RGBA, L) and local v2.2 inference so the VLM cannot exploit
-    dataset-specific intensity histograms as shortcuts. Pillow 13 safe.
-    """
-    import numpy as np
-    from PIL import Image
-
-    arr = np.asarray(pil_img)
-    if arr.ndim == 3:
-        arr_f = arr[..., :3].astype(np.float32).mean(axis=-1)
-    else:
-        arr_f = arr.astype(np.float32)
-
-    p1, p99 = np.percentile(arr_f, [1.0, 99.0])
-    if p99 > p1:
-        arr_f = np.clip((arr_f - p1) / (p99 - p1), 0.0, 1.0) * 255.0
-    elif float(arr_f.max()) > float(arr_f.min()):
-        arr_f = (arr_f - float(arr_f.min())) / (float(arr_f.max()) - float(arr_f.min())) * 255.0
-    else:
-        arr_f = np.zeros_like(arr_f)
-
-    rgb = Image.fromarray(arr_f.astype(np.uint8)).convert("RGB")
-    resample = getattr(Image, "Resampling", Image).BILINEAR
-    if rgb.size != (image_size, image_size):
-        rgb = rgb.resize((image_size, image_size), resample)
-    return rgb
+# Canonical `normalize_cxr_to_rgb` imported from `execution.preprocess` above.
 
 
 def _save_resized_image(pil_img: Any, out_path: Path, image_size: int = 512) -> str:

@@ -43,6 +43,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor, get_cosine_schedule_with_warmup
 
 from execution.build_rulebook_dataset import PATHOLOGY_ONTOLOGY, validate_rulebook_compliance
+from execution.preprocess import normalize_cxr_to_rgb
 
 AUX_CLASSES: list[str] = sorted(PATHOLOGY_ONTOLOGY.keys()) + ["Normal"]
 AUX_CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(AUX_CLASSES)}
@@ -206,12 +207,9 @@ class RulebookCXRDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.samples[idx]
-        resample = getattr(Image, "Resampling", Image).BILINEAR
-        image = Image.open(item["image_path"]).convert("RGB")
+        image = normalize_cxr_to_rgb(item["image_path"], image_size=self.image_size)
         if self.augment:
             image = _augment_cxr_nonflip(image, self.image_size)
-        elif image.size != (self.image_size, self.image_size):
-            image = image.resize((self.image_size, self.image_size), resample)
 
         messages = item["messages"]
         prompt_messages = messages[:-1]
@@ -657,10 +655,9 @@ def evaluate_validation_compliance(
     norm_total = 0
 
     normal_re = re.compile(r"\bno acute (?:cardiopulmonary|thoracic|pulmonary)\b|\bnormal chest radiograph\b")
-    resample = getattr(Image, "Resampling", Image).BILINEAR
 
     for row in rows:
-        img = Image.open(row["image_path"]).convert("RGB").resize((image_size, image_size), resample)
+        img = normalize_cxr_to_rgb(row["image_path"], image_size=image_size)
         prompt = processor.apply_chat_template(row["messages"][:-1], add_generation_prompt=True, tokenize=False)
         inputs = processor(text=[prompt], images=[[img]], return_tensors="pt")
         inputs = {k: v.to(device=device) for k, v in inputs.items()}
