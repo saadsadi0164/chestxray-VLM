@@ -45,7 +45,7 @@ _CLASS_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ],
     "Consolidation": [
         re.compile(
-            r"\bconsolidat\w*\b|\bair\s*space\s+(?:opac\w*|consolidat\w*|disease)\b|\blobar\s+opac\w*\b",
+            r"\bconsolidat\w*\b|\bair\s*space\s+(?:consolidat\w*|disease)\b|\blobar\s+opac\w*\b",
             re.IGNORECASE,
         ),
     ],
@@ -101,7 +101,7 @@ _CLASS_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"\b(?:pulmonary\s+|lung\s+)?mass(?:es)?\b", re.IGNORECASE),
     ],
     "Nodule": [
-        re.compile(r"\b(?:pulmonary\s+|lung\s+)?nodul\w*\b|\bgranuloma\w*\b", re.IGNORECASE),
+        re.compile(r"\b(?:pulmonary\s+|lung\s+)?nodul\w*\b|(?<!calcified\s)\bgranuloma\w*\b", re.IGNORECASE),
     ],
     "Lung Cavity": [
         re.compile(r"\bcavit\w*\b", re.IGNORECASE),
@@ -250,11 +250,41 @@ def _split_atomic_clauses(sentence: str) -> list[tuple[str, bool]]:
     return atomic
 
 
+def _extract_v3_sections(report_text: str) -> tuple[str | None, str | None]:
+    """Extracts FINDINGS and IMPRESSION bodies if present in a v3 structured report."""
+    m_f = re.search(r"^\s*FINDINGS\s*:\s*(.*)$", report_text, flags=re.IGNORECASE | re.MULTILINE)
+    if not m_f:
+        return None, None
+    f_body = m_f.group(1).strip()
+    m_i = re.search(r"^\s*IMPRESSION\s*:\s*(.+)$", report_text[m_f.end():], flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
+    i_body = m_i.group(1).strip() if m_i else ""
+    return f_body, i_body
+
+
+def _match_v3_finding_item(item_text: str) -> str | None:
+    """Matches one semicolon-delimited v3 FINDING item unambiguously via ontology name first."""
+    clean = item_text.strip()
+    if not clean:
+        return None
+    low = clean.lower()
+    if low == "none" or _CLAUSE_NEG_RE.search(low) or _HEDGE_RE.search(low):
+        return None
+    before_paren = clean.split("(", 1)[0].strip()
+    canon = canonicalize_label(before_paren)
+    if canon and canon in PATHOLOGY_ONTOLOGY:
+        return canon
+    for cls_name, patterns in _CLASS_PATTERNS.items():
+        if any(p.search(before_paren) for p in patterns):
+            return cls_name
+    return None
+
+
 def parse_report_findings(report_text: str) -> dict[str, str]:
     """
     Parses a radiology report into per-class clinical assertions:
       `"present" | "absent" | "uncertain"`
     for every canonical pathology class in `PATHOLOGY_ONTOLOGY`.
+    Supports both v3 (`FINDINGS: ... / IMPRESSION: ...`) and v1/v2 formats.
     """
     statuses: dict[str, str] = {canon: "absent" for canon in PATHOLOGY_ONTOLOGY}
     if not report_text or not report_text.strip():
@@ -265,51 +295,80 @@ def parse_report_findings(report_text: str) -> dict[str, str]:
     priority: dict[str, int] = {canon: 0 for canon in PATHOLOGY_ONTOLOGY}
     status_name = {0: "absent", 1: "uncertain", 2: "present"}
 
-    for raw_line in re.split(r"(?<=[.!?])\s+|\n+", report_text):
-        line = raw_line.strip()
-        if not line:
-            continue
-        if _SECTION_HEADER_RE.match(line) or _PROMPT_ECHO_RE.search(line) or _CAD_PROMPT_LINE_RE.match(line):
-            continue
+    v3_findings, v3_impression = _extract_v3_sections(report_text)
+    if v3_findings is not None:
+        if v3_findings.strip().upper() != "NONE":
+            for part in v3_findings.split(";"):
+                low_part = part.strip().lower()
+                if not low_part:
+                    continue
+                if _HEDGE_RE.search(low_part):
+                    before_p = part.split("(", 1)[0].strip()
+                    canon_h = canonicalize_label(before_p)
+                    if not canon_h:
+                        for c_name, pats in _CLASS_PATTERNS.items():
+                            if any(p.search(before_p) for p in pats):
+                                canon_h = c_name
+                                break
+                    if canon_h and priority[canon_h] < 1:
+                        priority[canon_h] = 1
+                else:
+                    matched_canon = _match_v3_finding_item(part)
+                    if matched_canon:
+                        priority[matched_canon] = 2
 
-        # Remove Mode-3 CAD refutation text so the refuted fake CAD term isn't scored as present
-        line = _CAD_REFUTATION_RE.sub(" ", line).strip()
-        if not line:
-            continue
+        text_to_scan = v3_impression or ""
+    else:
+        text_to_scan = report_text
 
-        list_neg_active = False
-        for clause, breaks_list in _split_atomic_clauses(line):
-            low = clause.lower().strip()
-            if not low:
+    if text_to_scan:
+        # Strip any FINDINGS: line already handled above if present
+        for raw_line in re.split(r"(?<=[.!?])\s+|\n+", text_to_scan):
+            line = raw_line.strip()
+            if not line or re.match(r"^\s*FINDINGS\s*:", line, flags=re.IGNORECASE):
+                continue
+            line = re.sub(r"^\s*IMPRESSION\s*:\s*", "", line, flags=re.IGNORECASE).strip()
+            if not line:
+                continue
+            if _SECTION_HEADER_RE.match(line) or _PROMPT_ECHO_RE.search(line) or _CAD_PROMPT_LINE_RE.match(line):
                 continue
 
-            if breaks_list or _NEW_ASSERTION_RE.search(low):
-                list_neg_active = False
+            # Remove Mode-3 CAD refutation text so the refuted fake CAD term isn't scored as present
+            line = _CAD_REFUTATION_RE.sub(" ", line).strip()
+            if not line:
+                continue
 
-            # Check if this clause starts or reinforces a negative list (e.g. "no evidence of pneumonia, pneumothorax, or effusion")
-            if _LIST_NEG_TRIGGER_RE.search(low) and not _HEDGE_RE.search(low):
-                list_neg_active = True
+            list_neg_active = False
+            for clause, breaks_list in _split_atomic_clauses(line):
+                low = clause.lower().strip()
+                if not low:
+                    continue
 
-            has_hedge = bool(_HEDGE_RE.search(low))
-            # Treat "cannot exclude" as uncertain even though it contains "cannot"/"exclude"
-            clause_wo_hedge = _HEDGE_RE.sub(" ", low)
-            has_neg = bool(_CLAUSE_NEG_RE.search(clause_wo_hedge)) or list_neg_active
+                if breaks_list or _NEW_ASSERTION_RE.search(low):
+                    list_neg_active = False
 
-            if has_hedge and not _CLAUSE_NEG_RE.search(clause_wo_hedge):
-                clause_state = 1  # uncertain
-            elif has_neg:
-                clause_state = 0  # absent
-                # Notice: in "but not clinically significant" -> absent
-            elif has_hedge:
-                # e.g. "no consolidation, though mild edema may represent..." -> handled by clause split, fallback uncertain
-                clause_state = 1
-            else:
-                clause_state = 2  # present
+                # Check if this clause starts or reinforces a negative list (e.g. "no evidence of pneumonia, pneumothorax, or effusion")
+                if _LIST_NEG_TRIGGER_RE.search(low) and not _HEDGE_RE.search(low):
+                    list_neg_active = True
 
-            for canon, patterns in _CLASS_PATTERNS.items():
-                if any(p.search(low) for p in patterns):
-                    if clause_state > priority[canon]:
-                        priority[canon] = clause_state
+                has_hedge = bool(_HEDGE_RE.search(low))
+                # Treat "cannot exclude" as uncertain even though it contains "cannot"/"exclude"
+                clause_wo_hedge = _HEDGE_RE.sub(" ", low)
+                has_neg = bool(_CLAUSE_NEG_RE.search(clause_wo_hedge)) or list_neg_active
+
+                if has_hedge and not _CLAUSE_NEG_RE.search(clause_wo_hedge):
+                    clause_state = 1  # uncertain
+                elif has_neg:
+                    clause_state = 0  # absent
+                elif has_hedge:
+                    clause_state = 1
+                else:
+                    clause_state = 2  # present
+
+                for canon, patterns in _CLASS_PATTERNS.items():
+                    if any(p.search(low) for p in patterns):
+                        if clause_state > priority[canon]:
+                            priority[canon] = clause_state
 
     for canon, prio in priority.items():
         statuses[canon] = status_name[prio]

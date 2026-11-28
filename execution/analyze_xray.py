@@ -50,6 +50,14 @@ SYSTEM_RULEBOOK = (
     "3. Clinical Impression"
 )
 
+SYSTEM_RULEBOOK_V3 = (
+    "You are an expert diagnostic chest X-ray AI radiologist.\n"
+    "Examine all airways, lungs, pleura, mediastinum, cardiac silhouette, and bones carefully.\n"
+    "Report every visual abnormality concisely with its exact anatomical zone using this exact 2-line format:\n"
+    "FINDINGS: <semicolon-separated \"Clinical Name (zone)\" list, or NONE>\n"
+    "IMPRESSION: <1-2 concise clinical sentences, or \"No acute cardiopulmonary abnormality identified on this frontal chest radiograph.\">"
+)
+
 ALL_PATHOLOGY_STEMS: dict[str, list[str]] = {
     "Pneumothorax": ["pneumothora"],
     "Effusion": ["effusion", "pleural fluid", "costophrenic blunting", "meniscus"],
@@ -318,7 +326,9 @@ class ChestXRayPipeline:
         self.base_model_id = base_model_id
         self.adapter_path = adapter_path
         self.use_lora = use_lora and os.path.isdir(adapter_path)
+        self.is_rulebook_v3 = os.path.isfile(os.path.join(adapter_path, "rulebook_v3.json"))
         self.is_rulebook_v2 = os.path.isfile(os.path.join(adapter_path, "rulebook_v2.json"))
+        self.is_rulebook_adapted = self.is_rulebook_v3 or self.is_rulebook_v2
 
         self.cnn_device = resolve_cnn_device(cnn_device)
         self.llm_device, self.llm_dtype = resolve_llm_device(llm_device, allow_mps_bf16=allow_mps_bf16)
@@ -367,7 +377,12 @@ class ChestXRayPipeline:
         user_prompt: str,
     ) -> dict[str, torch.Tensor]:
         image_rgb = normalize_cxr_to_rgb(image, image_size=512)
-        if self.is_rulebook_v2 or not self.use_lora:
+        if self.is_rulebook_v3:
+            messages = [
+                {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK_V3}]},
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_prompt}]},
+            ]
+        elif self.is_rulebook_v2 or not self.use_lora:
             messages = [
                 {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK}]},
                 {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_prompt}]},
@@ -407,7 +422,7 @@ class ChestXRayPipeline:
             gen_kwargs: dict[str, Any] = {
                 "max_new_tokens": max_new_tokens,
                 "do_sample": False,
-                "repetition_penalty": 1.08 if self.is_rulebook_v2 else 1.15,
+                "repetition_penalty": 1.08 if self.is_rulebook_adapted else 1.15,
             }
             if return_scores:
                 gen_kwargs["output_scores"] = True
@@ -462,10 +477,16 @@ class ChestXRayPipeline:
         t0 = time.perf_counter()
 
         if mode == "pure_vlm" or not self.ensemble_224:
+            if self.is_rulebook_v3:
+                pure_prompt = "Inspect this frontal chest X-ray and report FINDINGS and IMPRESSION."
+                pure_tokens = 128
+            else:
+                pure_prompt = "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
+                pure_tokens = 384 if self.is_rulebook_v2 else 250
             raw_report = self._generate_vlm_text(
                 image,
-                "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook.",
-                max_new_tokens=384 if self.is_rulebook_v2 else 250,
+                pure_prompt,
+                max_new_tokens=pure_tokens,
             )
             return {
                 "report": raw_report,
@@ -495,7 +516,20 @@ class ChestXRayPipeline:
 
         raw_vlm_text = ""
         if use_vlm:
-            if self.is_rulebook_v2:
+            if self.is_rulebook_v3:
+                if not cad_findings:
+                    cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold"
+                else:
+                    cad_summary = "; ".join(
+                        "{} at {}".format(d["clinical_name"], d["location"])
+                        for d in cad_findings[:4]
+                    )
+                user_prompt = (
+                    f"Candidate Ensemble CAD findings: {cad_summary}.\n"
+                    "Inspect this frontal chest X-ray, authenticate the CAD alerts, and report FINDINGS and IMPRESSION."
+                )
+                raw_vlm_text = self._generate_vlm_text(image, user_prompt, max_new_tokens=128)
+            elif self.is_rulebook_v2:
                 if not cad_findings:
                     cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold"
                 else:

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from execution.analyze_xray import SYSTEM_RULEBOOK
+from execution.analyze_xray import SYSTEM_RULEBOOK, SYSTEM_RULEBOOK_V3
 from execution.preprocess import normalize_cxr_to_rgb
 
 # =====================================================================
@@ -250,6 +250,7 @@ PATHOLOGY_ONTOLOGY: dict[str, dict[str, Any]] = {
 _ALIAS_TO_CANONICAL: dict[str, str] = {}
 for _canon, _meta in PATHOLOGY_ONTOLOGY.items():
     _ALIAS_TO_CANONICAL[_canon.lower()] = _canon
+    _ALIAS_TO_CANONICAL[_meta["clinical_name"].lower()] = _canon
     for _alias in _meta["aliases"]:
         _ALIAS_TO_CANONICAL[_alias.lower()] = _canon
 
@@ -390,17 +391,8 @@ def _flip_laterality(zone: str) -> str | None:
 # =====================================================================
 # 3. STRICT 5-RULE REPORT SYNTHESIZER & VALIDATOR
 # =====================================================================
-def build_rulebook_target(
-    findings: list[dict[str, Any]],
-    raw_report_note: str | None = None,
-    rejected_cad_notes: list[str] | None = None,
-) -> str:
-    """
-    Synthesizes a strictly rule-compliant 3-section radiological report from
-    grounded dataset annotations (`findings`: [{label, zone}]).
-    Optional `rejected_cad_notes` adds visual refutation sentences in Section 1
-    for Mode 3 (CAD-Authenticator Rejection) without contaminating Sections 2-3.
-    """
+def _dedupe_and_order_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Canonicalizes, deduplicates by pathology, merges zones, and sorts by urgency."""
     deduped: dict[str, dict[str, Any]] = {}
     for item in findings:
         canon = canonicalize_label(item["label"])
@@ -415,8 +407,21 @@ def build_rulebook_target(
             }
         elif zone not in deduped[canon]["zones"]:
             deduped[canon]["zones"].append(zone)
+    return sorted(deduped.values(), key=lambda x: x["urgency"])
 
-    ordered = sorted(deduped.values(), key=lambda x: x["urgency"])
+
+def build_rulebook_target(
+    findings: list[dict[str, Any]],
+    raw_report_note: str | None = None,
+    rejected_cad_notes: list[str] | None = None,
+) -> str:
+    """
+    Synthesizes a strictly rule-compliant 3-section radiological report from
+    grounded dataset annotations (`findings`: [{label, zone}]).
+    Optional `rejected_cad_notes` adds visual refutation sentences in Section 1
+    for Mode 3 (CAD-Authenticator Rejection) without contaminating Sections 2-3.
+    """
+    ordered = _dedupe_and_order_findings(findings)
     present_canons = {x["canon"] for x in ordered}
 
     # Rule 4: Explicit Negatives for acute emergencies not present
@@ -489,8 +494,95 @@ def build_rulebook_target(
     )
 
 
-def validate_rulebook_compliance(report: str) -> tuple[bool, list[str]]:
-    """Programmatically audits a generated/target report against the 5-rule protocol."""
+def build_v3_target(
+    findings: list[dict[str, Any]],
+    rejected_cad_notes: list[str] | None = None,
+) -> tuple[str, tuple[int, int]]:
+    """
+    Synthesizes the concise v3 target format without long Rule-4 chant boilerplate:
+      FINDINGS: <semicolon-separated "Clinical Name (zone)" list, or NONE>
+      IMPRESSION: <1-2 concise clinical sentences>
+    Returns (report_text, (findings_start, findings_end)) character offsets.
+    """
+    ordered = _dedupe_and_order_findings(findings)
+    has_rejected = bool([n for n in (rejected_cad_notes or []) if n and n.strip()])
+
+    if not ordered:
+        findings_line = "FINDINGS: NONE"
+        if has_rejected:
+            imp_text = (
+                "No acute cardiopulmonary abnormality identified on this frontal chest radiograph; "
+                "candidate CAD alerts are not substantiated on visual inspection."
+            )
+        else:
+            imp_text = "No acute cardiopulmonary abnormality identified on this frontal chest radiograph."
+    else:
+        finding_items: list[str] = []
+        plain_clauses: list[str] = []
+        for entry in ordered:
+            meta = PATHOLOGY_ONTOLOGY[entry["canon"]]
+            zone_str = " and ".join(entry["zones"][:2])
+            disp_name = meta["clinical_name"][0].upper() + meta["clinical_name"][1:]
+            finding_items.append(f"{disp_name} ({zone_str})")
+            plain_clauses.append(f"{meta['clinical_name']} involving the {zone_str}")
+        findings_line = "FINDINGS: " + "; ".join(finding_items)
+        summary_str = "; ".join(plain_clauses[:3])
+        if len(ordered) > 3:
+            summary_str += f", with {len(ordered) - 3} additional finding(s)"
+        if has_rejected:
+            imp_text = (
+                f"Radiographic findings indicate {summary_str}. "
+                "Unverified candidate CAD alerts are excluded visually."
+            )
+        else:
+            imp_text = f"Radiographic findings indicate {summary_str}. Clinical correlation is recommended."
+
+    report = f"{findings_line}\nIMPRESSION: {imp_text}"
+    return report, (0, len(findings_line))
+
+
+def validate_v3_compliance(report: str) -> tuple[bool, list[str]]:
+    """Validates concise v3 report format (FINDINGS before IMPRESSION, no Rule-4 chant)."""
+    errors: list[str] = []
+    m_f = re.search(r"^\s*FINDINGS\s*:", report, flags=re.MULTILINE)
+    m_i = re.search(r"^\s*IMPRESSION\s*:", report, flags=re.MULTILINE)
+    if not m_f:
+        errors.append("Missing FINDINGS: header.")
+    if not m_i:
+        errors.append("Missing IMPRESSION: header.")
+    if m_f and m_i:
+        if m_f.start() >= m_i.start():
+            errors.append("FINDINGS: must precede IMPRESSION:.")
+        else:
+            f_body = report[m_f.end() : m_i.start()].strip()
+            i_body = report[m_i.end() :].strip()
+            if not f_body:
+                errors.append("FINDINGS: body is empty (expected finding list or NONE).")
+            if not i_body:
+                errors.append("IMPRESSION: body is empty.")
+
+    lower = report.lower()
+    for banned in (
+        "no radiographic evidence of",
+        "1. systematic visual findings:",
+        "2. spatial localization:",
+        "3. clinical impression:",
+    ):
+        if banned in lower:
+            errors.append(f"Disallowed v2/Rule-4 boilerplate found in v3 report: {banned}")
+    return (len(errors) == 0), errors
+
+
+def validate_rulebook_compliance(report: str, version: str = "auto") -> tuple[bool, list[str]]:
+    """Programmatically audits a generated/target report for v2 (5-rule) or v3 format."""
+    ver = version.lower()
+    if ver == "v3" or (
+        ver == "auto"
+        and re.search(r"^\s*FINDINGS\s*:", report, flags=re.MULTILINE) is not None
+        and "1. Systematic Visual Findings:" not in report
+    ):
+        return validate_v3_compliance(report)
+
     errors: list[str] = []
     required_headers = [
         "1. Systematic Visual Findings:",
@@ -779,6 +871,7 @@ def load_chestx_det_hf(
         mask_sigs.append((len(uniq_set) == 0, 2 in uniq_set, 5 in uniq_set, img_w, img_h))
         records.append({
             "source": f"ChestX-Det-{split}",
+            "patient_id": f"chestxdet_{split}_{idx:06d}",
             "group_id": f"chestx_det_{split}_{idx:06d}",
             "image_path": img_file,
             "findings": findings,
@@ -801,6 +894,8 @@ def load_chestx_det_hf(
             if empty_ok >= 0.99 and cardio_ok >= 0.98 and eff_ok >= 0.95:
                 for rec, sig, it in zip(records, mask_sigs, cand):
                     rec["findings"] = _findings_from_deepwise_item(it, sig[3], sig[4])
+                    if it.get("file_name"):
+                        rec["patient_id"] = f"chestxdet_{Path(str(it['file_name'])).stem}"
                 print(
                     f"[Loader] ChestX-Det ({split}): VERIFIED 1-to-1 official Deepwise JSON ({order_name}: "
                     f"empty={empty_ok:.1%}, cardio={cardio_ok:.1%}, eff={eff_ok:.1%}) -> uncorrupted 13-class boxes active!",
@@ -877,6 +972,7 @@ def load_chexpert_hf(
 
         records.append({
             "source": "CheXpert",
+            "patient_id": group_id,
             "group_id": group_id,
             "image_path": img_file,
             "findings": findings,
@@ -934,6 +1030,7 @@ def load_padchest_gr_hf(
             )
             studies[study_key] = {
                 "source": f"PadChest-GR-{split}",
+                "patient_id": f"padchest_{group_raw}",
                 "group_id": f"padchest_{split}_{group_raw}",
                 "image_path": img_file,
                 "findings": [],
@@ -996,6 +1093,7 @@ def load_padchest_gr_hf(
         if entry["findings"]:
             records.append({
                 "source": entry["source"],
+                "patient_id": entry["patient_id"],
                 "group_id": entry["group_id"],
                 "image_path": entry["image_path"],
                 "findings": entry["findings"],
@@ -1004,6 +1102,7 @@ def load_padchest_gr_hf(
         elif entry["_explicit_normal"] and not entry["_has_unmapped_abn"]:
             records.append({
                 "source": entry["source"],
+                "patient_id": entry["patient_id"],
                 "group_id": entry["group_id"],
                 "image_path": entry["image_path"],
                 "findings": [],
@@ -1066,8 +1165,10 @@ def load_siim_pneumo_hf(
                     "zone": PATHOLOGY_ONTOLOGY["Pneumothorax"]["default_zone"],
                 })
 
+        image_id = str(row.get("image_id") or f"{idx:06d}")
         records.append({
             "source": f"SIIM-Pneumothorax-{split}",
+            "patient_id": f"siim_{image_id}",
             "group_id": f"siim_pneumo_{split}_{idx:06d}",
             "image_path": img_file,
             "findings": findings,
@@ -1107,6 +1208,7 @@ def load_vindr_csv(csv_path: str, image_dir: str, max_samples: int | None = None
         ]
         records.append({
             "source": "VinDr-CXR",
+            "patient_id": f"vindr_{img_id}",
             "group_id": f"vindr_{img_id}",
             "image_path": str(img_path),
             "findings": findings,
@@ -1132,6 +1234,7 @@ def load_generic_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
                 norm_findings.append({"label": canon, "zone": zone})
             records.append({
                 "source": item.get("source", "custom"),
+                "patient_id": str(item.get("patient_id") or item.get("group_id") or f"custom_{idx:06d}"),
                 "group_id": item.get("group_id") or f"custom_{idx:06d}",
                 "image_path": item["image_path"],
                 "findings": norm_findings,
@@ -1143,15 +1246,109 @@ def load_generic_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
 # =====================================================================
 # 5. LEAK-FREE SPLITTING, REBALANCING & 3-MODE AUTHENTICATOR FORMATTING
 # =====================================================================
+PRIORITY_CLASSES: tuple[str, ...] = (
+    "Pneumothorax",
+    "Effusion",
+    "Consolidation",
+    "Cardiomegaly",
+    "Edema",
+    "Nodule",
+    "Mass",
+    "Atelectasis",
+    "Fracture",
+)
+
+
+def _record_patient_key(rec: dict[str, Any], idx: int = 0) -> str:
+    """Canonical patient identifier used across leakage filtering, splitting, and assertions."""
+    return str(rec.get("patient_id") or rec.get("group_id") or rec.get("image_path") or f"rec_{idx}")
+
+
+def load_excluded_patient_ids(json_path: str | Path | None) -> set[str]:
+    """Loads held-out patient IDs from either a JSON list or a JSONL manifest."""
+    if not json_path:
+        return set()
+    p = Path(json_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Excluded patients file not found: {p}")
+    text = p.read_text(encoding="utf-8").strip()
+    if not text:
+        return set()
+    excluded: set[str] = set()
+    if text.startswith("[") or text.startswith("{"):
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            for entry in parsed:
+                if isinstance(entry, dict):
+                    pid = entry.get("patient_id") or entry.get("group_id")
+                    if pid:
+                        excluded.add(str(pid))
+                elif entry:
+                    excluded.add(str(entry))
+        elif isinstance(parsed, dict):
+            for pid in parsed.get("patient_ids", []):
+                if pid:
+                    excluded.add(str(pid))
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            pid = obj.get("patient_id") or obj.get("group_id")
+            if pid:
+                excluded.add(str(pid))
+    return excluded
+
+
+def filter_excluded_patients(
+    records: list[dict[str, Any]],
+    excluded_ids: set[str],
+) -> tuple[list[dict[str, Any]], int]:
+    """Strips any study matching an excluded patient/group ID BEFORE splitting or balancing."""
+    if not excluded_ids:
+        return list(records), 0
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for idx, rec in enumerate(records):
+        pid = _record_patient_key(rec, idx)
+        gid = str(rec.get("group_id") or "")
+        if pid in excluded_ids or (gid and gid in excluded_ids):
+            removed += 1
+            continue
+        kept.append(rec)
+    return kept, removed
+
+
+def assert_zero_patient_leakage(
+    train_recs: list[dict[str, Any]],
+    val_recs: list[dict[str, Any]],
+    excluded_ids: set[str] | None = None,
+) -> None:
+    """Asserts strictly zero patient overlap across train, val, and held-out exclusion lists."""
+    train_pids = {_record_patient_key(r, i) for i, r in enumerate(train_recs)}
+    val_pids = {_record_patient_key(r, i) for i, r in enumerate(val_recs)}
+    tv_overlap = train_pids & val_pids
+    if tv_overlap:
+        raise AssertionError(f"Patient leakage between train and val splits: {sorted(tv_overlap)[:5]}")
+    if excluded_ids:
+        te_overlap = train_pids & excluded_ids
+        ve_overlap = val_pids & excluded_ids
+        if te_overlap or ve_overlap:
+            raise AssertionError(
+                f"Held-out patient leakage detected! train={len(te_overlap)}, val={len(ve_overlap)}"
+            )
+
+
 def split_records_by_group(
     records: list[dict[str, Any]],
     val_ratio: float = 0.10,
     seed: int = 42,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Splits studies by patient/image group_id BEFORE oversampling so zero images leak into val."""
+    """Splits studies strictly by patient/group ID BEFORE oversampling so zero patients leak into val."""
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for idx, rec in enumerate(records):
-        gid = rec.get("group_id") or rec.get("image_path") or f"rec_{idx}"
+        gid = _record_patient_key(rec, idx)
         grouped[gid].append(rec)
 
     group_ids = list(grouped.keys())
@@ -1174,50 +1371,196 @@ def split_records_by_group(
     return train_recs, val_recs
 
 
+def _copy_with_variant(rec: dict[str, Any], variant_idx: int) -> dict[str, Any]:
+    out = dict(rec)
+    out["aug_variant"] = variant_idx
+    return out
+
+
 def balance_records_against_normal_bias(
     records: list[dict[str, Any]],
     max_normal_ratio: float = 0.20,
-    min_class_count: int = 300,
+    min_class_count: int = 400,
     seed: int = 42,
 ) -> list[dict[str, Any]]:
     """
-    Rebalances training dataset to eradicate "Normal-biased" hallucination:
-    - Caps Normal-only studies to at most `max_normal_ratio` of final training set.
-    - Oversamples underrepresented etiologies up to `min_class_count` occurrences.
+    Rebalances training dataset to eradicate "Normal-biased" and source-shortcut learning:
+      - Oversamples underrepresented etiologies up to `min_class_count`, tagging copies
+        with incrementing `aug_variant: k` so training applies distinct non-flip jitter.
+      - Enforces per-source Normal balance (~50/50 for SIIM-Pneumothorax; ~20-25% for
+        other sources with Normals) while capping global Normals at `max_normal_ratio`.
     """
     rng = random.Random(seed)
-    normal_recs = [r for r in records if not r["findings"]]
-    abnormal_recs = [r for r in records if r["findings"]]
+    normal_recs = [_copy_with_variant(r, 0) for r in records if not r["findings"]]
+    abnormal_recs = [_copy_with_variant(r, 0) for r in records if r["findings"]]
 
     if not abnormal_recs:
         return records
 
     by_class: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for rec in abnormal_recs:
+    copy_counter: Counter[str] = Counter()
+    for idx, rec in enumerate(abnormal_recs):
+        pid = _record_patient_key(rec, idx)
         seen_in_rec = set()
         for f_item in rec["findings"]:
             lbl = f_item["label"]
             if lbl not in seen_in_rec:
                 by_class[lbl].append(rec)
                 seen_in_rec.add(lbl)
+        copy_counter[pid] = 0
 
-    balanced = list(abnormal_recs)
-    for canon, class_recs in by_class.items():
+    balanced_abn = list(abnormal_recs)
+    for canon in sorted(by_class.keys()):
+        class_recs = by_class[canon]
         if 0 < len(class_recs) < min_class_count:
             needed = min_class_count - len(class_recs)
-            balanced.extend(rng.choices(class_recs, k=needed))
+            picked = rng.choices(class_recs, k=needed)
+            for idx, base_rec in enumerate(picked):
+                pid = _record_patient_key(base_rec, idx)
+                copy_counter[pid] += 1
+                balanced_abn.append(_copy_with_variant(base_rec, copy_counter[pid]))
 
-    max_normals = max(1, int(len(balanced) * (max_normal_ratio / max(1e-5, 1.0 - max_normal_ratio))))
-    if len(normal_recs) > max_normals:
-        normal_recs = rng.sample(normal_recs, max_normals)
+    # Per-source Normal allocation under global max_normal_ratio cap
+    max_globals = max(1, int(len(balanced_abn) * (max_normal_ratio / max(1e-5, 1.0 - max_normal_ratio))))
+    abn_by_src: Counter[str] = Counter(str(r.get("source", "default")) for r in balanced_abn)
+    norm_by_src: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in normal_recs:
+        norm_by_src[str(r.get("source", "default"))].append(r)
 
-    combined = balanced + normal_recs
+    siim_srcs = [s for s in norm_by_src if "siim" in s.lower()]
+    other_srcs = [s for s in norm_by_src if "siim" not in s.lower()]
+
+    src_targets: dict[str, int] = {}
+    budget_left = max_globals
+    for s in siim_srcs:
+        abn_cnt = abn_by_src.get(s, 0)
+        want = abn_cnt if abn_cnt > 0 else min(len(norm_by_src[s]), max(1, max_globals // 4))
+        take_n = min(want, budget_left)
+        src_targets[s] = take_n
+        budget_left = max(0, budget_left - take_n)
+
+    raw_other_wants: dict[str, int] = {}
+    for s in other_srcs:
+        abn_cnt = abn_by_src.get(s, 0)
+        if abn_cnt > 0:
+            raw_other_wants[s] = max(1, int(round(abn_cnt * 0.22 / 0.78)))
+        else:
+            raw_other_wants[s] = len(norm_by_src[s])
+
+    sum_other = sum(raw_other_wants.values())
+    if sum_other > 0 and budget_left > 0:
+        for s in other_srcs:
+            if sum_other <= budget_left:
+                src_targets[s] = raw_other_wants[s]
+            else:
+                src_targets[s] = max(1 if budget_left >= len(other_srcs) else 0, int(round(raw_other_wants[s] * (budget_left / sum_other))))
+    else:
+        for s in other_srcs:
+            src_targets[s] = 0
+
+    # Enforce strict global budget ceiling if rounding pushed sum slightly over
+    total_norm_target = sum(src_targets.values())
+    if total_norm_target > max_globals and total_norm_target > 0:
+        excess = total_norm_target - max_globals
+        for s in sorted(src_targets.keys(), key=lambda k: src_targets[k], reverse=True):
+            if excess <= 0:
+                break
+            drop = min(excess, src_targets[s])
+            src_targets[s] -= drop
+            excess -= drop
+
+    selected_normals: list[dict[str, Any]] = []
+    for s, target_n in src_targets.items():
+        pool = norm_by_src[s]
+        if target_n <= 0 or not pool:
+            continue
+        if len(pool) >= target_n:
+            selected_normals.extend(rng.sample(pool, target_n))
+        else:
+            selected_normals.extend(pool)
+            needed = target_n - len(pool)
+            for idx, base_rec in enumerate(rng.choices(pool, k=needed)):
+                pid = _record_patient_key(base_rec, idx)
+                copy_counter[pid] += 1
+                selected_normals.append(_copy_with_variant(base_rec, copy_counter[pid]))
+
+    combined = balanced_abn + selected_normals
     rng.shuffle(combined)
     return combined
 
 
-def _build_cad_prompt(cad_summary: str) -> str:
+def validate_min_class_counts(
+    records: list[dict[str, Any]],
+    min_class_count: int,
+    strict: bool = True,
+) -> dict[str, int]:
+    """Counts per-class occurrences across records and fails loudly if any loaded priority class < min_class_count."""
+    counts: Counter[str] = Counter()
+    for rec in records:
+        if not rec.get("findings"):
+            counts["Normal"] += 1
+        else:
+            for lbl in {f["label"] for f in rec["findings"]}:
+                counts[lbl] += 1
+
+    if strict and min_class_count > 0:
+        shortfalls = {
+            cls: counts[cls]
+            for cls in PRIORITY_CLASSES
+            if 0 < counts[cls] < min_class_count
+        }
+        if shortfalls:
+            raise ValueError(
+                f"--strict-min-class failed: loaded priority class(es) below min_class_count={min_class_count}: {shortfalls}"
+            )
+    return dict(counts)
+
+
+def print_dataset_summary_table(
+    train_recs: list[dict[str, Any]],
+    val_recs: list[dict[str, Any]],
+) -> None:
+    """Prints Per-Source Normal Balance and Class-Count tables cleanly during build."""
+    print("\n" + "=" * 78)
+    print("DATASET BUILDER: PER-SOURCE NORMAL BALANCE TABLE (TRAIN / VAL)")
+    print("=" * 78)
+    print(f"  {'Split/Source':<28} | {'Total':>7} | {'Abnormal':>8} | {'Normal':>7} | {'Normal %':>8}")
+    print("-" * 78)
+    for split_name, subset in (("TRAIN", train_recs), ("VAL", val_recs)):
+        by_src: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for r in subset:
+            by_src[str(r.get("source", "default"))].append(r)
+        for src in sorted(by_src.keys()):
+            recs = by_src[src]
+            n_tot = len(recs)
+            n_norm = sum(1 for r in recs if not r.get("findings"))
+            n_abn = n_tot - n_norm
+            pct = (100.0 * n_norm / n_tot) if n_tot else 0.0
+            print(f"  {f'{split_name}:{src}':<28} | {n_tot:>7} | {n_abn:>8} | {n_norm:>7} | {pct:>7.1f}%")
+
+    class_counts: Counter[str] = Counter()
+    for r in train_recs:
+        if not r.get("findings"):
+            class_counts["Normal"] += 1
+        else:
+            for lbl in {f["label"] for f in r["findings"]}:
+                class_counts[lbl] += 1
+
+    print("-" * 78)
+    print("TRAIN CLASS-COUNT TABLE (* = Priority Finding):")
+    for cls, cnt in sorted(class_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        star = "*" if cls in PRIORITY_CLASSES else " "
+        print(f"  {star} {cls:<26}: {cnt:>6}")
+    print("=" * 78 + "\n", flush=True)
+
+
+def _build_cad_prompt(cad_summary: str, format_version: str = "v2") -> str:
     """Shared CAD prompt template used identically in Mode 2 (confirm) and Mode 3 (reject)."""
+    if format_version == "v3":
+        return (
+            f"Candidate Ensemble CAD findings: {cad_summary}.\n"
+            "Inspect this frontal chest X-ray, authenticate the CAD alerts, and report FINDINGS and IMPRESSION."
+        )
     return (
         f"Candidate Ensemble CAD findings: {cad_summary}.\n"
         "Authenticate these CAD alerts against the radiograph and analyze this chest X-ray "
@@ -1312,8 +1655,9 @@ def format_vlm_chat_sample(
     mode: str | None = None,
     rng: random.Random | None = None,
     class_weights: dict[str, float] | None = None,
+    format_version: str = "v3",
 ) -> dict[str, Any]:
-    """Formats a record into SmolVLM chat messages + validates 5-Rule compliance."""
+    """Formats a record into SmolVLM chat messages (v3 concise or v2 5-rule) + validates compliance."""
     effective_mode = mode or ("cad_aligned" if include_cad_context else "pure")
     local_rng = rng or random.Random(42)
 
@@ -1321,7 +1665,10 @@ def format_vlm_chat_sample(
     rejection_subtype: str | None = None
 
     if effective_mode == "pure":
-        user_text = "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
+        if format_version == "v3":
+            user_text = "Inspect this frontal chest X-ray and report FINDINGS and IMPRESSION."
+        else:
+            user_text = "Analyze this chest X-ray step-by-step according to the 5-Rule Clinical Rulebook."
     elif effective_mode == "cad_aligned":
         if not record["findings"]:
             cad_summary = "No acute cardiopulmonary pathology detected above Dual-Gate threshold"
@@ -1330,38 +1677,55 @@ def format_vlm_chat_sample(
                 f"{PATHOLOGY_ONTOLOGY[f['label']]['clinical_name']} at {f['zone']}"
                 for f in record["findings"][:4]
             )
-        user_text = _build_cad_prompt(cad_summary)
+        user_text = _build_cad_prompt(cad_summary, format_version=format_version)
     elif effective_mode == "cad_reject":
         cad_summary, rejected_notes, rejection_subtype = _build_mode3_rejection_payload(
             record, local_rng, class_weights=class_weights
         )
-        user_text = _build_cad_prompt(cad_summary)
+        user_text = _build_cad_prompt(cad_summary, format_version=format_version)
     else:
         raise ValueError(f"Unsupported mode: {effective_mode}")
 
-    target_report = build_rulebook_target(
-        record["findings"],
-        raw_report_note=record.get("note"),
-        rejected_cad_notes=rejected_notes,
-    )
-    ok, errs = validate_rulebook_compliance(target_report)
-    if not ok:
-        raise ValueError(f"Generated target failed rulebook validation: {errs}")
+    findings_span: list[int] | None = None
+    if format_version == "v3":
+        target_report, span_tuple = build_v3_target(
+            record["findings"],
+            rejected_cad_notes=rejected_notes,
+        )
+        findings_span = [span_tuple[0], span_tuple[1]]
+        system_prompt = SYSTEM_RULEBOOK_V3
+    else:
+        target_report = build_rulebook_target(
+            record["findings"],
+            raw_report_note=record.get("note"),
+            rejected_cad_notes=rejected_notes,
+        )
+        system_prompt = SYSTEM_RULEBOOK
 
-    return {
+    ok, errs = validate_rulebook_compliance(target_report, version=format_version)
+    if not ok:
+        raise ValueError(f"Generated target failed {format_version} validation: {errs}")
+
+    sample_out: dict[str, Any] = {
         "source": record.get("source", "unknown"),
+        "patient_id": str(record.get("patient_id") or record.get("group_id") or ""),
         "group_id": record.get("group_id", ""),
         "image_path": record["image_path"],
         "labels": [f["label"] for f in record["findings"]],
         "mode": effective_mode,
         "rejection_subtype": rejection_subtype,
         "cad_conditioned": effective_mode != "pure",
+        "format_version": format_version,
+        "aug_variant": int(record.get("aug_variant", 0)),
         "messages": [
-            {"role": "system", "content": [{"type": "text", "text": SYSTEM_RULEBOOK}]},
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]},
             {"role": "assistant", "content": [{"type": "text", "text": target_report}]},
         ],
     }
+    if findings_span is not None:
+        sample_out["findings_span"] = findings_span
+    return sample_out
 
 
 def _emit_three_mode_samples(
@@ -1369,11 +1733,13 @@ def _emit_three_mode_samples(
     seed: int = 42,
     pure_ratio: float = 0.50,
     cad_aligned_ratio: float = 0.20,
+    format_version: str = "v3",
 ) -> list[dict[str, Any]]:
     """
-    Balanced 3-Mode v2.2 mixture with frequency-matched CAD distractors:
-      - Abnormal studies: 50% Pure-Image, 20% CAD-Aligned, 30% CAD-Reject (half full-FP, half distractor)
-      - Normal studies:   40% Pure-Image, 10% CAD-Aligned, 50% CAD-Reject (normal_fp)
+    Emits 3-Mode mixture with frequency-matched CAD distractors:
+      - When pure_ratio >= 0.70 (v3 pure-first default 80/10/10), uses exact pure/aligned/reject
+        proportions across both Normal and Abnormal studies.
+      - When pure_ratio < 0.70 (legacy v2.2 mix), retains 40/10/50 split on Normal studies.
     """
     rng = random.Random(seed)
     pos_counts: Counter[str] = Counter()
@@ -1389,7 +1755,7 @@ def _emit_three_mode_samples(
     samples: list[dict[str, Any]] = []
     for rec in records:
         r = rng.random()
-        if not rec["findings"]:
+        if (not rec["findings"]) and (pure_ratio < 0.70):
             if r < 0.40:
                 mode = "pure"
             elif r < 0.50:
@@ -1403,7 +1769,15 @@ def _emit_three_mode_samples(
                 mode = "cad_aligned"
             else:
                 mode = "cad_reject"
-        samples.append(format_vlm_chat_sample(rec, mode=mode, rng=rng, class_weights=class_weights))
+        samples.append(
+            format_vlm_chat_sample(
+                rec,
+                mode=mode,
+                rng=rng,
+                class_weights=class_weights,
+                format_version=format_version,
+            )
+        )
     rng.shuffle(samples)
     return samples
 
@@ -1454,7 +1828,7 @@ def export_holdout_benchmarks(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build balanced 3-Mode 5-Rule CoT training JSONL for SmolVLM.")
+    parser = argparse.ArgumentParser(description="Build balanced 3-Mode CXR training JSONL for SmolVLM (v3 default).")
     parser.add_argument("--chestx-det", action="store_true", help="Include HuggingFace natealberti/ChestX-Det.")
     parser.add_argument("--chexpert-hf", action="store_true", help="Include HuggingFace danjacobellis/chexpert.")
     parser.add_argument("--padchest-gr", action="store_true", help="Include HuggingFace JasonZZ0601/PadChest-GR-Xray.")
@@ -1464,8 +1838,13 @@ def main() -> None:
     parser.add_argument("--vindr-csv", type=str, default=None, help="Path to VinDr-CXR train.csv.")
     parser.add_argument("--vindr-images", type=str, default=None, help="Path to VinDr-CXR images folder.")
     parser.add_argument("--custom-jsonl", type=str, default=None, help="Path to custom JSONL manifest.")
-    parser.add_argument("--max-normal-ratio", type=float, default=0.20, help="Max fraction of Normal studies.")
-    parser.add_argument("--min-class-count", type=int, default=300, help="Oversample target per etiology.")
+    parser.add_argument("--exclude-patients-json", type=str, default=None, help="JSON list/JSONL manifest of held-out patient IDs to exclude before splitting.")
+    parser.add_argument("--format-version", choices=["v2", "v3"], default="v3", help="Target report format (v3 short FINDINGS/IMPRESSION or v2 5-rule).")
+    parser.add_argument("--pure-ratio", type=float, default=0.80, help="Fraction of Pure-Image CoT examples (v3 default 0.80).")
+    parser.add_argument("--cad-aligned-ratio", type=float, default=0.10, help="Fraction of CAD-Aligned examples (remainder is CAD-Reject).")
+    parser.add_argument("--max-normal-ratio", type=float, default=0.20, help="Max global fraction of Normal studies.")
+    parser.add_argument("--min-class-count", type=int, default=400, help="Oversample target per etiology.")
+    parser.add_argument("--strict-min-class", action=argparse.BooleanOptionalAction, default=True, help="Fail loudly if any loaded priority class < min_class_count.")
     parser.add_argument("--val-ratio", type=float, default=0.10, help="Validation split fraction (leak-free).")
     parser.add_argument("--image-size", type=int, default=512, help="Cached RGB JPEG size.")
     parser.add_argument("--img-cache-dir", type=str, default="./.tmp/training_images", help="Image cache folder (use /kaggle/tmp on Kaggle).")
@@ -1488,11 +1867,11 @@ def main() -> None:
         if not os.path.exists(sample_img):
             raise FileNotFoundError(f"Smoke test image missing: {sample_img}")
         records = [
-            {"source": "smoke_normal", "group_id": "smoke_1", "image_path": sample_img, "findings": []},
-            {"source": "smoke_aortic", "group_id": "smoke_2", "image_path": sample_img, "findings": [
+            {"source": "smoke_normal", "patient_id": "smoke_1", "group_id": "smoke_1", "image_path": sample_img, "findings": []},
+            {"source": "smoke_aortic", "patient_id": "smoke_2", "group_id": "smoke_2", "image_path": sample_img, "findings": [
                 {"label": "Aortic Enlargement", "zone": "superior mediastinum / left aortic arch"}
             ]},
-            {"source": "smoke_ptx", "group_id": "smoke_3", "image_path": sample_img, "findings": [
+            {"source": "smoke_ptx", "patient_id": "smoke_3", "group_id": "smoke_3", "image_path": sample_img, "findings": [
                 {"label": "Pneumothorax", "zone": "right apical pleural space"}
             ]},
         ]
@@ -1530,35 +1909,57 @@ def main() -> None:
         print("No dataset inputs provided. Pass --chestx-det, --padchest-gr, --chexpert-hf, --siim-pneumo, or --smoke-sample.")
         return
 
+    excluded_ids = load_excluded_patient_ids(args.exclude_patients_json)
+    if excluded_ids:
+        records, n_excluded = filter_excluded_patients(records, excluded_ids)
+        print(f"[Leakage Guard] Excluded {n_excluded} study record(s) matching {len(excluded_ids)} held-out patient IDs.", flush=True)
+
     # 1. Leak-free group split BEFORE oversampling
     if args.smoke_sample:
         train_recs = records
         val_recs = records[:2]
     else:
         train_recs, val_recs = split_records_by_group(records, val_ratio=args.val_ratio, seed=args.seed)
+        assert_zero_patient_leakage(train_recs, val_recs, excluded_ids=excluded_ids)
         train_recs = balance_records_against_normal_bias(
             train_recs,
             max_normal_ratio=args.max_normal_ratio,
             min_class_count=args.min_class_count,
             seed=args.seed,
         )
+        assert_zero_patient_leakage(train_recs, val_recs, excluded_ids=excluded_ids)
+        validate_min_class_counts(train_recs, args.min_class_count, strict=args.strict_min_class)
 
-    # 2. Emit 3-Mode training mix (40% Pure / 35% CAD-Aligned / 25% CAD-Rejection)
+    print_dataset_summary_table(train_recs, val_recs)
+
+    # 2. Emit 3-Mode training mix (v3 default: 80% Pure / 10% CAD-Aligned / 10% CAD-Rejection)
     if args.smoke_sample:
         rng = random.Random(args.seed)
         train_samples = [
-            format_vlm_chat_sample(train_recs[0], mode="pure", rng=rng),
-            format_vlm_chat_sample(train_recs[1], mode="cad_aligned", rng=rng),
-            format_vlm_chat_sample(train_recs[0], mode="cad_reject", rng=rng),
-            format_vlm_chat_sample(train_recs[2], mode="cad_reject", rng=rng),
+            format_vlm_chat_sample(train_recs[0], mode="pure", rng=rng, format_version=args.format_version),
+            format_vlm_chat_sample(train_recs[1], mode="cad_aligned", rng=rng, format_version=args.format_version),
+            format_vlm_chat_sample(train_recs[0], mode="cad_reject", rng=rng, format_version=args.format_version),
+            format_vlm_chat_sample(train_recs[2], mode="cad_reject", rng=rng, format_version=args.format_version),
         ]
         val_samples = [
-            format_vlm_chat_sample(val_recs[0], mode="pure", rng=rng),
-            format_vlm_chat_sample(val_recs[1], mode="cad_reject", rng=rng),
+            format_vlm_chat_sample(val_recs[0], mode="pure", rng=rng, format_version=args.format_version),
+            format_vlm_chat_sample(val_recs[1], mode="cad_reject", rng=rng, format_version=args.format_version),
         ]
     else:
-        train_samples = _emit_three_mode_samples(train_recs, seed=args.seed, pure_ratio=0.50, cad_aligned_ratio=0.20)
-        val_samples = _emit_three_mode_samples(val_recs, seed=args.seed + 1, pure_ratio=0.50, cad_aligned_ratio=0.20)
+        train_samples = _emit_three_mode_samples(
+            train_recs,
+            seed=args.seed,
+            pure_ratio=args.pure_ratio,
+            cad_aligned_ratio=args.cad_aligned_ratio,
+            format_version=args.format_version,
+        )
+        val_samples = _emit_three_mode_samples(
+            val_recs,
+            seed=args.seed + 1,
+            pure_ratio=args.pure_ratio,
+            cad_aligned_ratio=args.cad_aligned_ratio,
+            format_version=args.format_version,
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

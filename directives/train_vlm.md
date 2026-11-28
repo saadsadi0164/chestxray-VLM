@@ -1,4 +1,6 @@
-# Directive: Multi-Dataset Anti-Hallucination VLM Training
+# Directive: Multi-Dataset Anti-Hallucination VLM Training (Legacy v2 SOP)
+
+> **Note:** For the active **v3 Phase 4** Kaggle T4 pipeline (short `FINDINGS:`/`IMPRESSION:` format, offset loss weighting, Mean+Max `aux_head.pt`, and per-source balanced training), see [`directives/train_v3.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/directives/train_v3.md) and [`scripts/run_kaggle_v3.sh`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/scripts/run_kaggle_v3.sh).
 
 ## Goal
 Train `HuggingFaceTB/SmolVLM-500M-Instruct` across diverse multi-institutional chest X-ray datasets covering 25 thoracic etiologies and findings while strictly enforcing the 5-Rule Clinical Rulebook and eliminating "Normal-biased" and laterality hallucinations.

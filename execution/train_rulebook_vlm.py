@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import math
 import os
@@ -152,25 +153,100 @@ def _compute_decision_token_weights(
     return loss_weights
 
 
-def _augment_cxr_nonflip(image: Image.Image, image_size: int) -> Image.Image:
-    """Gentle non-flip radiograph augmentation (NEVER horizontally flips so left/right laterality stays exact)."""
+def _compute_offset_token_weights(
+    input_ids: torch.Tensor,
+    prompt_len: int,
+    tokenizer: Any,
+    assistant_text: str,
+    findings_span: list[int] | tuple[int, int] | None,
+    findings_weight: float = 5.0,
+    base_weight: float = 1.0,
+) -> torch.Tensor:
+    """
+    Exact offset-based token weighting for v3 format:
+      - 0.0 to masked prompt/image tokens
+      - `findings_weight` (5.0x) to assistant tokens overlapping `findings_span`
+      - `base_weight` (1.0x) to all remaining assistant tokens
+    """
+    loss_weights = torch.zeros_like(input_ids, dtype=torch.float32)
+    unmasked_ids = input_ids[prompt_len:].tolist()
+    if not unmasked_ids:
+        return loss_weights
+
+    loss_weights[prompt_len:] = base_weight
+    if not findings_span or len(findings_span) != 2:
+        return loss_weights
+
+    s_start, s_end = int(findings_span[0]), int(findings_span[1])
+    if s_end <= s_start or s_end > len(assistant_text):
+        return loss_weights
+
+    pieces = [tokenizer.decode([tid], skip_special_tokens=False) for tid in unmasked_ids]
+    recon = "".join(pieces)
+    span_sub = assistant_text[s_start:s_end]
+    pos = recon.find(span_sub)
+    if pos != -1:
+        abs_start, abs_end = pos, pos + len(span_sub)
+    else:
+        anchor = recon.find("FINDINGS:")
+        base = anchor if anchor != -1 else 0
+        abs_start, abs_end = base + s_start, base + s_end
+
+    cursor = 0
+    for rel_i, piece in enumerate(pieces):
+        p_start = cursor
+        p_end = cursor + len(piece)
+        cursor = p_end
+        if p_end <= p_start:
+            continue
+        if p_start < abs_end and p_end > abs_start:
+            loss_weights[prompt_len + rel_i] = findings_weight
+    return loss_weights
+
+
+def _augment_cxr_nonflip(image: Image.Image, image_size: int, aug_variant: int = 0) -> Image.Image:
+    """
+    Non-flip radiograph augmentation strictly after `normalize_cxr_to_rgb`:
+      - optional random downscale 224..384px -> resize back to image_size (p=0.50)
+      - optional light JPEG compression quality 75..95 (p=0.40)
+      - border crop 0..5% -> resize back to image_size
+      - brightness & contrast jitter 0.90..1.10
+    NEVER horizontally flips so left/right laterality stays exact.
+    """
+    resample = getattr(Image, "Resampling", Image).BILINEAR
+
+    if random.random() < 0.50:
+        down_dim = random.randint(224, min(384, image_size))
+        image = image.resize((down_dim, down_dim), resample).resize((image_size, image_size), resample)
+
+    if random.random() < 0.40:
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=random.randint(75, 95))
+        buf.seek(0)
+        with Image.open(buf) as jpeg_img:
+            image = jpeg_img.convert("RGB")
+
     w, h = image.size
-    if random.random() < 0.70 and w >= 64 and h >= 64:
-        mx = int(w * random.uniform(0.0, 0.03))
-        my = int(h * random.uniform(0.0, 0.03))
+    if (aug_variant > 0 or random.random() < 0.75) and w >= 64 and h >= 64:
+        mx = int(w * random.uniform(0.0, 0.05))
+        my = int(h * random.uniform(0.0, 0.05))
         if mx > 0 or my > 0:
             image = image.crop((mx, my, w - mx, h - my))
-    resample = getattr(Image, "Resampling", Image).BILINEAR
+
     if image.size != (image_size, image_size):
         image = image.resize((image_size, image_size), resample)
-    if random.random() < 0.70:
-        image = ImageEnhance.Brightness(image).enhance(random.uniform(0.90, 1.10))
-        image = ImageEnhance.Contrast(image).enhance(random.uniform(0.90, 1.10))
+
+    if aug_variant > 0 or random.random() < 0.70:
+        variant_shift = (((aug_variant % 5) - 2) * 0.015) if aug_variant > 0 else 0.0
+        b_factor = max(0.90, min(1.10, random.uniform(0.90, 1.10) + variant_shift))
+        c_factor = max(0.90, min(1.10, random.uniform(0.90, 1.10) - variant_shift))
+        image = ImageEnhance.Brightness(image).enhance(b_factor)
+        image = ImageEnhance.Contrast(image).enhance(c_factor)
     return image
 
 
 class RulebookCXRDataset(Dataset):
-    """Loads JSONL chat records and produces assistant-only labels, decision weights, and multi-hot aux targets."""
+    """Loads JSONL chat records and produces assistant-only labels, offset/decision weights, and multi-hot aux targets."""
 
     def __init__(
         self,
@@ -179,6 +255,7 @@ class RulebookCXRDataset(Dataset):
         image_size: int = 512,
         diag_weight: float = 6.0,
         decision_weight: float = 8.0,
+        findings_weight: float = 5.0,
         augment: bool = False,
     ):
         self.samples: list[dict[str, Any]] = []
@@ -191,6 +268,7 @@ class RulebookCXRDataset(Dataset):
         self.image_size = image_size
         self.diag_weight = diag_weight
         self.decision_weight = decision_weight
+        self.findings_weight = findings_weight
         self.augment = augment
 
     def compute_aux_pos_weights(self, max_weight: float = 6.0) -> torch.Tensor:
@@ -206,11 +284,47 @@ class RulebookCXRDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    @staticmethod
+    def _is_v3_item(item: dict[str, Any]) -> bool:
+        return item.get("format_version") == "v3" or "findings_span" in item
+
+    def compute_loss_weights_for_item(
+        self,
+        item: dict[str, Any],
+        input_ids: torch.Tensor,
+        prompt_len: int,
+    ) -> torch.Tensor:
+        if self._is_v3_item(item):
+            assistant_text = str(item["messages"][-1]["content"][0]["text"])
+            f_span = item.get("findings_span")
+            if not f_span or len(f_span) != 2:
+                raise ValueError(f"v3 sample missing valid findings_span: {item.get('group_id', '')}")
+            return _compute_offset_token_weights(
+                input_ids,
+                prompt_len=prompt_len,
+                tokenizer=self.processor.tokenizer,
+                assistant_text=assistant_text,
+                findings_span=f_span,
+                findings_weight=self.findings_weight,
+                base_weight=1.0,
+            )
+        return _compute_decision_token_weights(
+            input_ids,
+            prompt_len=prompt_len,
+            tokenizer=self.processor.tokenizer,
+            diag_weight=self.diag_weight,
+            decision_weight=self.decision_weight,
+        )
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.samples[idx]
         image = normalize_cxr_to_rgb(item["image_path"], image_size=self.image_size)
         if self.augment:
-            image = _augment_cxr_nonflip(image, self.image_size)
+            image = _augment_cxr_nonflip(
+                image,
+                self.image_size,
+                aug_variant=int(item.get("aug_variant", 0)),
+            )
 
         messages = item["messages"]
         prompt_messages = messages[:-1]
@@ -235,13 +349,7 @@ class RulebookCXRDataset(Dataset):
 
         labels = input_ids.clone()
         labels[:prompt_len] = -100
-        loss_weights = _compute_decision_token_weights(
-            input_ids,
-            prompt_len=prompt_len,
-            tokenizer=self.processor.tokenizer,
-            diag_weight=self.diag_weight,
-            decision_weight=self.decision_weight,
-        )
+        loss_weights = self.compute_loss_weights_for_item(item, input_ids, prompt_len)
 
         batch = {k: v[0] for k, v in full_inputs.items()}
         batch["labels"] = labels
@@ -283,8 +391,13 @@ class VisualConnectorHook:
         self.captured = None
 
 
-def verify_loss_masking(dataset: RulebookCXRDataset, processor: Any) -> None:
-    """Prints a one-time forensic check of sample 0 so masking & decision weights are verified before Epoch 1."""
+def verify_loss_masking(dataset: RulebookCXRDataset, processor: Any) -> dict[str, Any]:
+    """
+    Runs forensic verification before Epoch 1:
+      - Checks sample 0 prompt masking & weighted target tokens.
+      - Scans ALL v3 abnormal samples and asserts every abnormal sample has > 0
+        tokens weighted at `dataset.findings_weight` (5.0x).
+    """
     if len(dataset) == 0:
         raise RuntimeError("Training dataset is empty.")
     sample = dataset[0]
@@ -294,9 +407,15 @@ def verify_loss_masking(dataset: RulebookCXRDataset, processor: Any) -> None:
 
     masked_ids = [t for t, l in zip(ids, lbls) if l == -100]
     unmasked_ids = [t for t, l in zip(ids, lbls) if l != -100]
-    dec_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w >= 7.5]
-    diag_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and 1.5 < w < 7.5]
-    boiler_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w <= 1.5]
+    thresh_high = min(dataset.findings_weight, 7.5) - 1e-4
+
+    is_v3_ds = any(dataset._is_v3_item(s) for s in dataset.samples)
+    if is_v3_ds:
+        weighted_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w >= (dataset.findings_weight - 1e-4)]
+        base_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w < (dataset.findings_weight - 1e-4)]
+    else:
+        weighted_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w >= thresh_high]
+        base_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w < thresh_high]
 
     if not unmasked_ids:
         raise RuntimeError("Forensic check failed: 0 unmasked assistant target tokens found!")
@@ -304,10 +423,61 @@ def verify_loss_masking(dataset: RulebookCXRDataset, processor: Any) -> None:
     print("[Masking Check] Masked prompt tail  :", repr(processor.tokenizer.decode(masked_ids[-20:])))
     print("[Masking Check] Unmasked target head:", repr(processor.tokenizer.decode(unmasked_ids[:25])))
     print("[Masking Check] Unmasked target tail:", repr(processor.tokenizer.decode(unmasked_ids[-15:])))
-    print(
-        f"[Weighting Check] Decision (8x): {len(dec_ids)} | Findings (6x): {len(diag_ids)} | "
-        f"Boilerplate (0.4x): {len(boiler_ids)} | Decision preview: {repr(processor.tokenizer.decode(dec_ids[:25]))}"
-    )
+
+    abn_scanned = 0
+    min_5x_tokens: int | None = None
+    max_5x_tokens = 0
+    tok = processor.tokenizer
+
+    for idx, item in enumerate(dataset.samples):
+        if not dataset._is_v3_item(item):
+            continue
+        abn_lbls = [lbl for lbl in (item.get("labels") or []) if str(lbl).strip().lower() != "normal"]
+        if not abn_lbls:
+            continue
+        abn_scanned += 1
+        # Text-only prompt/full tokenization mirrors exact assistant token alignment quickly across all rows
+        p_txt = processor.apply_chat_template(item["messages"][:-1], add_generation_prompt=True, tokenize=False)
+        f_txt = processor.apply_chat_template(item["messages"], add_generation_prompt=False, tokenize=False)
+        if callable(tok):
+            p_ids = tok(p_txt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+            f_ids = tok(f_txt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+        else:
+            p_ids = torch.tensor(tok.encode(p_txt), dtype=torch.long)
+            f_ids = torch.tensor(tok.encode(f_txt), dtype=torch.long)
+        p_len = _find_exact_prompt_len(p_ids, f_ids)
+        w_vec = dataset.compute_loss_weights_for_item(item, f_ids, p_len)
+        cnt_5x = int((w_vec >= (dataset.findings_weight - 1e-4)).sum().item())
+        if cnt_5x <= 0:
+            raise RuntimeError(
+                f"Abnormal sample idx={idx} ({item.get('group_id', '')}) has 0 tokens weighted at "
+                f"{dataset.findings_weight}x! Refusing to train with zero findings weighting."
+            )
+        min_5x_tokens = cnt_5x if min_5x_tokens is None else min(min_5x_tokens, cnt_5x)
+        max_5x_tokens = max(max_5x_tokens, cnt_5x)
+
+    if is_v3_ds:
+        print(
+            f"[Weighting Check v3] Sample0 {dataset.findings_weight:.1f}x tokens={len(weighted_ids)} | "
+            f"1.0x tokens={len(base_ids)} | Scanned {abn_scanned} abnormal sample(s): "
+            f"min_5x_tokens={min_5x_tokens or 0}, max_5x_tokens={max_5x_tokens} | "
+            f"Preview={repr(tok.decode(weighted_ids[:25]))}"
+        )
+    else:
+        dec_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w >= 7.5]
+        diag_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and 1.5 < w < 7.5]
+        boiler_ids = [t for t, l, w in zip(ids, lbls, wts) if l != -100 and w <= 1.5]
+        print(
+            f"[Weighting Check v2] Decision (8x): {len(dec_ids)} | Findings (6x): {len(diag_ids)} | "
+            f"Boilerplate (0.4x): {len(boiler_ids)} | Decision preview: {repr(tok.decode(dec_ids[:25]))}"
+        )
+
+    return {
+        "sample0_weighted_tokens": len(weighted_ids),
+        "abnormal_scanned": abn_scanned,
+        "min_5x_tokens": min_5x_tokens or 0,
+        "max_5x_tokens": max_5x_tokens,
+    }
 
 
 def collate_single_or_padded(batch: list[dict[str, torch.Tensor]], pad_token_id: int) -> dict[str, torch.Tensor]:
@@ -472,18 +642,37 @@ def _autocast_ctx(device: str, amp_dtype: torch.dtype):
     return contextlib.nullcontext()
 
 
+def build_aux_visual_head(hidden_dim: int, num_classes: int = len(AUX_CLASSES)) -> nn.Sequential:
+    """Builds the training-only Mean+Max pooled visual classifier head (`2 * H -> AUX_CLASSES`)."""
+    return nn.Sequential(
+        nn.LayerNorm(2 * hidden_dim),
+        nn.Dropout(0.1),
+        nn.Linear(2 * hidden_dim, num_classes),
+    )
+
+
+def _extract_aux_in_dim(aux_head: nn.Module) -> int | None:
+    if isinstance(aux_head, nn.Sequential):
+        for layer in reversed(aux_head):
+            if hasattr(layer, "in_features"):
+                return int(layer.in_features)
+    if hasattr(aux_head, "in_features"):
+        return int(aux_head.in_features)
+    return None
+
+
 def compute_multitask_loss(
     model: Any,
     batch: dict[str, torch.Tensor],
     vis_hook: VisualConnectorHook | None = None,
     aux_head: nn.Module | None = None,
     aux_pos_weight: torch.Tensor | None = None,
-    aux_loss_weight: float = 0.5,
+    aux_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
-    Computes decision-weighted LM loss + training-only auxiliary visual multi-label BCE loss
-    in fp32 for rock-solid Tesla T4 numerical stability.
-    Returns: (total_loss, diag_lm_loss, aux_bce_loss, aux_logits_or_None)
+    Computes offset/decision-weighted LM loss + training-only Mean+Max pooled auxiliary
+    visual multi-label BCE loss in fp32 for rock-solid Tesla T4 numerical stability.
+    Returns: (total_loss, findings_lm_loss, aux_bce_loss, aux_logits_or_None)
     """
     labels = batch["labels"]
     loss_weights = batch.get("loss_weights")
@@ -535,7 +724,12 @@ def compute_multitask_loss(
         bsz = int(labels.shape[0])
         fp32_ctx = torch.amp.autocast(device_type="cuda", enabled=False) if lm_loss.is_cuda else contextlib.nullcontext()
         with fp32_ctx:
-            vis_emb = captured.reshape(bsz, -1, captured.shape[-1]).float().mean(dim=1)
+            vis_seq = captured.reshape(bsz, -1, captured.shape[-1]).float()
+            expected_in = _extract_aux_in_dim(aux_head)
+            if expected_in == 2 * int(vis_seq.shape[-1]):
+                vis_emb = torch.cat([vis_seq.mean(dim=1), vis_seq.max(dim=1).values], dim=-1)
+            else:
+                vis_emb = vis_seq.mean(dim=1)
             aux_logits = aux_head(vis_emb)
             pos_w = aux_pos_weight.float() if aux_pos_weight is not None else None
             aux_loss = F.binary_cross_entropy_with_logits(
@@ -651,6 +845,8 @@ def evaluate_validation_compliance(
         all_rows = [json.loads(line) for line in f if line.strip()]
     pure_rows = [r for r in all_rows if r.get("mode") == "pure"][:max_eval]
     rows = pure_rows if pure_rows else all_rows[:max_eval]
+    is_v3_val = any(r.get("format_version") == "v3" or "findings_span" in r for r in rows)
+    gen_tokens = 128 if is_v3_val else 384
 
     eval_records: list[dict[str, Any]] = []
     abn_any_hits = 0
@@ -666,7 +862,7 @@ def evaluate_validation_compliance(
         with _autocast_ctx(device, amp_dtype):
             out_ids = model.generate(
                 **inputs,
-                max_new_tokens=384,
+                max_new_tokens=gen_tokens,
                 do_sample=False,
                 repetition_penalty=1.08,
             )
@@ -711,12 +907,15 @@ def save_adapter_bundle(
     adapt_vision: bool,
     image_size: int,
     extra_meta: dict[str, Any] | None = None,
+    aux_head: nn.Module | None = None,
+    format_version: str = "v3",
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir)
     processor.save_pretrained(out_dir)
     meta = {
-        "rulebook_format": "5-rule-system-v2.2",
+        "rulebook_format": f"chestxstudio-{format_version}",
+        "format_version": format_version,
         "adapt_vision": adapt_vision,
         "image_size": image_size,
         "do_image_splitting": False,
@@ -724,24 +923,38 @@ def save_adapter_bundle(
     }
     if extra_meta:
         meta.update(extra_meta)
-    with open(out_dir / "rulebook_v2.json", "w", encoding="utf-8") as mf:
+    meta_filename = "rulebook_v3.json" if format_version == "v3" else "rulebook_v2.json"
+    with open(out_dir / meta_filename, "w", encoding="utf-8") as mf:
         json.dump(meta, mf, indent=2)
+
+    if aux_head is not None:
+        in_dim = _extract_aux_in_dim(aux_head) or 0
+        torch.save(
+            {
+                "state_dict": {k: v.detach().cpu() for k, v in aux_head.state_dict().items()},
+                "classes": list(AUX_CLASSES),
+                "pooling": "mean_max",
+                "in_dim": in_dim,
+            },
+            out_dir / "aux_head.pt",
+        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train SmolVLM-500M with Rulebook CoT LoRA + Aux Visual Head (v2.2).")
+    parser = argparse.ArgumentParser(description="Train SmolVLM-500M with LoRA + Offset Loss + Mean/Max Aux Visual Head (v3).")
     parser.add_argument("--base-model", type=str, default="HuggingFaceTB/SmolVLM-500M-Instruct")
     parser.add_argument("--train-jsonl", type=str, required=True)
     parser.add_argument("--val-jsonl", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="./.tmp/rulebook_lora_ckpt")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--connector-lr", type=float, default=5e-5)
-    parser.add_argument("--aux-loss-weight", type=float, default=0.5, help="Weight on training-only visual multi-label BCE head.")
-    parser.add_argument("--diag-weight", type=float, default=6.0, help="Loss multiplier on Section 1 findings/refutations.")
-    parser.add_argument("--decision-weight", type=float, default=8.0, help="Loss multiplier on Localization & Impression.")
+    parser.add_argument("--aux-loss-weight", type=float, default=1.0, help="Weight on Mean+Max visual multi-label BCE head.")
+    parser.add_argument("--findings-weight", type=float, default=5.0, help="Exact offset loss multiplier on v3 FINDINGS line.")
+    parser.add_argument("--diag-weight", type=float, default=6.0, help="Legacy v2 loss multiplier on Section 1 findings.")
+    parser.add_argument("--decision-weight", type=float, default=8.0, help="Legacy v2 loss multiplier on Localization & Impression.")
     parser.add_argument("--lora-r", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -753,6 +966,7 @@ def main() -> None:
     parser.add_argument("--no-augment", action="store_true", help="Disable non-flip training image augmentation.")
     parser.add_argument("--eval-val-samples", type=int, default=200, help="Pure-mode val samples scored per epoch.")
     parser.add_argument("--dry-run-steps", type=int, default=0, help="Stop after N optimizer steps for smoke testing.")
+    parser.add_argument("--verify-startup-only", action="store_true", help="Verify dataset masking, hook wiring, forward pass, and aux_head.pt export without backward pass.")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -771,12 +985,6 @@ def main() -> None:
     if args.quantize_4bit and device != "cuda":
         raise RuntimeError("--quantize-4bit requires a CUDA GPU with bitsandbytes.")
 
-    print(
-        f"[Trainer v2.2] Device={device} | AMP dtype={amp_dtype} | 4-bit={args.quantize_4bit} | "
-        f"Image={args.image_size}px | Weights=(boiler=0.4x, find={args.diag_weight:.1f}x, dec={args.decision_weight:.1f}x) | "
-        f"AuxLoss={args.aux_loss_weight} | Augment={not args.no_augment}"
-    )
-
     try:
         processor = AutoProcessor.from_pretrained(args.base_model, local_files_only=True)
     except Exception:
@@ -791,6 +999,7 @@ def main() -> None:
         image_size=args.image_size,
         diag_weight=args.diag_weight,
         decision_weight=args.decision_weight,
+        findings_weight=args.findings_weight,
         augment=not args.no_augment,
     )
     val_ds = RulebookCXRDataset(
@@ -799,8 +1008,18 @@ def main() -> None:
         image_size=args.image_size,
         diag_weight=args.diag_weight,
         decision_weight=args.decision_weight,
+        findings_weight=args.findings_weight,
         augment=False,
     )
+    is_v3_ds = any(train_ds._is_v3_item(s) for s in train_ds.samples)
+    format_version = "v3" if is_v3_ds else "v2"
+
+    print(
+        f"[Trainer {format_version}] Device={device} | AMP dtype={amp_dtype} | 4-bit={args.quantize_4bit} | "
+        f"Image={args.image_size}px | FindingsWeight={args.findings_weight:.1f}x | "
+        f"AuxLoss={args.aux_loss_weight} | Augment={not args.no_augment}"
+    )
+
     verify_loss_masking(train_ds, processor)
 
     train_loader = DataLoader(
@@ -838,13 +1057,12 @@ def main() -> None:
         vis_hook = VisualConnectorHook(model)
         if vis_hook.connector_module is not None:
             hidden_dim = _resolve_text_hidden_size(model)
-            aux_head = nn.Sequential(
-                nn.LayerNorm(hidden_dim),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, len(AUX_CLASSES)),
-            ).to(device=device, dtype=torch.float32)
+            aux_head = build_aux_visual_head(hidden_dim, len(AUX_CLASSES)).to(device=device, dtype=torch.float32)
             aux_pos_weight = train_ds.compute_aux_pos_weights(max_weight=6.0).to(device=device)
-            print(f"[Aux Visual Head] Hooked {type(vis_hook.connector_module).__name__} -> Linear({hidden_dim}, {len(AUX_CLASSES)})")
+            print(
+                f"[Aux Visual Head] Hooked {type(vis_hook.connector_module).__name__} (Mean+Max) -> "
+                f"Linear({2 * hidden_dim}, {len(AUX_CLASSES)})"
+            )
         else:
             print("[Warning] Connector module not found; proceeding without auxiliary visual head.")
             vis_hook = None
@@ -857,6 +1075,41 @@ def main() -> None:
         aux_lr=1e-3,
         weight_decay=0.01,
     )
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.verify_startup_only:
+        with torch.no_grad():
+            first_batch = next(iter(train_loader))
+            first_batch = {k: v.to(device=device) for k, v in first_batch.items()}
+            with _autocast_ctx(device, amp_dtype):
+                t_loss, d_loss, a_loss, a_logits = compute_multitask_loss(
+                    model,
+                    first_batch,
+                    vis_hook=vis_hook,
+                    aux_head=aux_head,
+                    aux_pos_weight=aux_pos_weight,
+                    aux_loss_weight=args.aux_loss_weight,
+                )
+            print(
+                f"[Startup Verify] Forward OK: total={float(t_loss):.4f} findings={float(d_loss):.4f} "
+                f"aux={float(a_loss):.4f} aux_logits_shape={tuple(a_logits.shape) if a_logits is not None else None} "
+                f"hook_cleared={vis_hook.captured is None if vis_hook is not None else True}"
+            )
+        save_adapter_bundle(
+            model,
+            processor,
+            out_dir,
+            args.adapt_vision,
+            args.image_size,
+            {"verify_startup_only": True},
+            aux_head=aux_head,
+            format_version=format_version,
+        )
+        if vis_hook is not None:
+            vis_hook.remove()
+        print(f"[Startup Verify] Saved rulebook_{format_version}.json and aux_head.pt -> {out_dir}")
+        return
     steps_per_epoch = max(1, math.ceil(len(train_loader) / max(1, args.grad_accum)))
     total_steps = max(1, steps_per_epoch * args.epochs)
     scheduler = get_cosine_schedule_with_warmup(
@@ -869,10 +1122,11 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda") if use_scaler else None
     clip_params = list(model.parameters()) + (list(aux_head.parameters()) if aux_head is not None else [])
 
-    out_dir = Path(args.output_dir)
+    train_log_path = out_dir / "train_log.jsonl"
     best_combined_score = float("-inf")
     best_diag_val = float("inf")
     opt_steps = 0
+    non_finite_count = 0
 
     model.train()
     if aux_head is not None:
@@ -902,10 +1156,15 @@ def main() -> None:
                 )
 
             if not torch.isfinite(raw_loss):
-                print(f"[Warning] Non-finite loss at epoch {epoch + 1} step {step}; skipping micro-batch.")
+                non_finite_count += 1
+                print(f"[Warning] Non-finite loss (#{non_finite_count}) at epoch {epoch + 1} step {step}; clearing grads.")
+                if vis_hook is not None:
+                    vis_hook.clear()
                 optimizer.zero_grad(set_to_none=True)
                 running_loss = running_diag = running_aux = 0.0
                 accum_count = 0
+                if non_finite_count >= 2:
+                    raise RuntimeError("Aborting training: non-finite/NaN loss occurred 2 times.")
                 continue
 
             scaled_loss = raw_loss / max(1, window_size)
@@ -935,12 +1194,24 @@ def main() -> None:
                 avg_loss = running_loss / max(1, accum_count)
                 avg_diag = running_diag / max(1, accum_count)
                 avg_aux = running_aux / max(1, accum_count)
+                cur_lr = float(scheduler.get_last_lr()[0])
                 if opt_steps == 1 or opt_steps % 10 == 0 or args.dry_run_steps > 0:
                     print(
                         f"[Epoch {epoch + 1}/{args.epochs} | Step {opt_steps}/{total_steps}] "
-                        f"loss={avg_loss:.4f} diag={avg_diag:.4f} aux_bce={avg_aux:.4f} "
-                        f"grad_norm={float(grad_norm):.2f} lr={scheduler.get_last_lr()[0]:.2e}"
+                        f"loss={avg_loss:.4f} findings_loss={avg_diag:.4f} aux_bce={avg_aux:.4f} "
+                        f"grad_norm={float(grad_norm):.2f} lr={cur_lr:.2e}"
                     )
+                    if opt_steps % 10 == 0 or args.dry_run_steps > 0 or opt_steps == 1:
+                        with open(train_log_path, "a", encoding="utf-8") as lf:
+                            lf.write(json.dumps({
+                                "epoch": epoch + 1,
+                                "step": opt_steps,
+                                "total_loss": round(avg_loss, 5),
+                                "findings_loss": round(avg_diag, 5),
+                                "aux_loss": round(avg_aux, 5),
+                                "grad_norm": round(float(grad_norm), 4),
+                                "lr": cur_lr,
+                            }) + "\n")
                 running_loss = running_diag = running_aux = 0.0
                 accum_count = 0
 
@@ -948,8 +1219,17 @@ def main() -> None:
                     break
 
         if args.dry_run_steps > 0 and opt_steps >= args.dry_run_steps:
-            save_adapter_bundle(model, processor, out_dir, args.adapt_vision, args.image_size, {"dry_run": True})
-            print(f"[Trainer] Dry-run complete. Saved checkpoint to {out_dir}")
+            save_adapter_bundle(
+                model,
+                processor,
+                out_dir,
+                args.adapt_vision,
+                args.image_size,
+                {"dry_run": True},
+                aux_head=aux_head,
+                format_version=format_version,
+            )
+            print(f"[Trainer] Dry-run complete. Saved checkpoint (+ aux_head.pt) to {out_dir}")
             break
 
         val_m = compute_validation_metrics(
@@ -1004,10 +1284,17 @@ def main() -> None:
                     "best_false_alarm_rate": round(eval_m["pure_false_alarm_rate"], 4),
                     "aux_loss_weight": args.aux_loss_weight,
                 },
+                aux_head=aux_head,
+                format_version=format_version,
             )
             print(
                 f"[Trainer] New best checkpoint saved to {out_dir} "
                 f"(epoch {epoch + 1}, combined_score={best_combined_score:.4f}, diag_val={best_diag_val:.4f})"
+            )
+
+        if epoch == 0 and aux_head is not None and args.aux_loss_weight > 0.0 and val_m["aux_macro_f1"] < 0.15:
+            raise RuntimeError(
+                f"Aborting training: visual aux_macro_f1={val_m['aux_macro_f1']:.4f} < 0.15 after Epoch 1."
             )
 
     # Remove training hook cleanly before running generation audit
