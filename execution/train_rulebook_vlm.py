@@ -44,6 +44,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, get_cosine_
 
 from execution.build_rulebook_dataset import PATHOLOGY_ONTOLOGY, validate_rulebook_compliance
 from execution.preprocess import normalize_cxr_to_rgb
+from execution.report_parser import compute_clinical_metrics, parse_report_findings
 
 AUX_CLASSES: list[str] = sorted(PATHOLOGY_ONTOLOGY.keys()) + ["Normal"]
 AUX_CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(AUX_CLASSES)}
@@ -633,9 +634,14 @@ def evaluate_validation_compliance(
     device: str,
     amp_dtype: torch.dtype,
     image_size: int = 512,
-    max_eval: int = 30,
+    max_eval: int = 200,
 ) -> dict[str, float]:
-    """Audits PURE-MODE unseen validation studies separately (no cad_aligned inflation)."""
+    """
+    Audits PURE-MODE unseen validation studies using the negation-aware
+    `report_parser` (`compute_clinical_metrics`) so checkpoint selection tracks
+    real macro sensitivity, normal-bias rate, false-alarm rate, and combined score.
+    """
+    was_training = bool(model.training)
     model.eval()
     if hasattr(model, "config"):
         model.config.use_cache = True
@@ -646,15 +652,9 @@ def evaluate_validation_compliance(
     pure_rows = [r for r in all_rows if r.get("mode") == "pure"][:max_eval]
     rows = pure_rows if pure_rows else all_rows[:max_eval]
 
-    total = 0
-    compliant = 0
-    abn_hits = 0
+    eval_records: list[dict[str, Any]] = []
+    abn_any_hits = 0
     abn_total = 0
-    normal_bias = 0
-    norm_hits = 0
-    norm_total = 0
-
-    normal_re = re.compile(r"\bno acute (?:cardiopulmonary|thoracic|pulmonary)\b|\bnormal chest radiograph\b")
 
     for row in rows:
         img = normalize_cxr_to_rgb(row["image_path"], image_size=image_size)
@@ -672,34 +672,35 @@ def evaluate_validation_compliance(
             )
         pred = processor.decode(out_ids[0][in_len:], skip_special_tokens=True).strip()
 
-        total += 1
-        ok, _ = validate_rulebook_compliance(pred)
-        if ok:
-            compliant += 1
-
-        pred_low = pred.lower()
-        gt_labels = [lbl.lower() for lbl in row.get("labels", []) if lbl.lower() != "normal"]
+        status_map = parse_report_findings(pred)
+        pred_present = sorted(k for k, v in status_map.items() if v == "present")
+        gt_labels = [lbl for lbl in row.get("labels", []) if str(lbl).strip().lower() != "normal"]
         if gt_labels:
             abn_total += 1
-            hit = any(re.search(rf"\b{re.escape(lbl.split()[0])}", pred_low) for lbl in gt_labels)
-            if hit:
-                abn_hits += 1
-            elif normal_re.search(pred_low):
-                normal_bias += 1
-        else:
-            norm_total += 1
-            if normal_re.search(pred_low):
-                norm_hits += 1
+            if set(gt_labels) & set(pred_present):
+                abn_any_hits += 1
+
+        eval_records.append({
+            "gt_findings": gt_labels,
+            "report": pred,
+            "pred_status": status_map,
+        })
 
     if hasattr(model, "config"):
         model.config.use_cache = False
+    if was_training:
+        model.train()
 
+    summary = compute_clinical_metrics(eval_records)
     return {
-        "pure_eval_samples": float(total),
-        "pure_rulebook_compliance": (compliant / total) if total else 0.0,
-        "pure_abnormal_sensitivity": (abn_hits / abn_total) if abn_total else 1.0,
-        "pure_abnormal_normal_bias": (normal_bias / abn_total) if abn_total else 0.0,
-        "pure_normal_specificity": (norm_hits / norm_total) if norm_total else 1.0,
+        "pure_eval_samples": float(summary["total_studies"]),
+        "pure_rulebook_compliance": float(summary["rulebook_compliance"]),
+        "pure_macro_sensitivity": float(summary["macro_sensitivity"]),
+        "pure_abnormal_sensitivity": (abn_any_hits / abn_total) if abn_total else 1.0,
+        "pure_abnormal_normal_bias": float(summary["normal_bias_rate"]),
+        "pure_false_alarm_rate": float(summary["false_alarm_rate"]),
+        "pure_normal_specificity": 1.0 - float(summary["false_alarm_rate"]),
+        "combined_score": float(summary["combined_score"]),
     }
 
 
@@ -750,6 +751,7 @@ def main() -> None:
     parser.add_argument("--quantize-4bit", action="store_true", help="Enable NF4 QLoRA (CUDA GPU only).")
     parser.add_argument("--adapt-vision", action="store_true", help="Adapt SigLIP attention + MLP and modality connector.")
     parser.add_argument("--no-augment", action="store_true", help="Disable non-flip training image augmentation.")
+    parser.add_argument("--eval-val-samples", type=int, default=200, help="Pure-mode val samples scored per epoch.")
     parser.add_argument("--dry-run-steps", type=int, default=0, help="Stop after N optimizer steps for smoke testing.")
     args = parser.parse_args()
 
@@ -868,6 +870,7 @@ def main() -> None:
     clip_params = list(model.parameters()) + (list(aux_head.parameters()) if aux_head is not None else [])
 
     out_dir = Path(args.output_dir)
+    best_combined_score = float("-inf")
     best_diag_val = float("inf")
     opt_steps = 0
 
@@ -960,13 +963,29 @@ def main() -> None:
             aux_loss_weight=args.aux_loss_weight,
             max_batches=120,
         )
+        eval_m = evaluate_validation_compliance(
+            model,
+            processor,
+            val_jsonl=args.val_jsonl,
+            device=device,
+            amp_dtype=amp_dtype,
+            image_size=args.image_size,
+            max_eval=args.eval_val_samples,
+        )
+        cur_score = float(eval_m["combined_score"])
         print(
-            f"[Epoch {epoch + 1}/{args.epochs}] val_loss={val_m['val_loss']:.4f} | "
-            f"diag_val={val_m['diag_val_loss']:.4f} (best={best_diag_val:.4f}) | "
-            f"aux_val={val_m['aux_val_loss']:.4f} | aux_macro_f1={val_m['aux_macro_f1']:.3f}"
+            f"[Epoch {epoch + 1}/{args.epochs}] combined_score={cur_score:.4f} (best={best_combined_score:.4f}) | "
+            f"diag_val={val_m['diag_val_loss']:.4f} | val_loss={val_m['val_loss']:.4f} | "
+            f"aux_val={val_m['aux_val_loss']:.4f} | aux_macro_f1={val_m['aux_macro_f1']:.3f} | "
+            f"macro_sens={eval_m['pure_macro_sensitivity']:.1%} | norm_bias={eval_m['pure_abnormal_normal_bias']:.1%} | "
+            f"fa={eval_m['pure_false_alarm_rate']:.1%} | rule_ok={eval_m['pure_rulebook_compliance']:.1%}"
         )
 
-        if val_m["diag_val_loss"] < best_diag_val:
+        is_better = (cur_score > best_combined_score + 1e-6) or (
+            abs(cur_score - best_combined_score) <= 1e-6 and val_m["diag_val_loss"] < best_diag_val
+        )
+        if is_better:
+            best_combined_score = cur_score
             best_diag_val = val_m["diag_val_loss"]
             save_adapter_bundle(
                 model,
@@ -976,13 +995,20 @@ def main() -> None:
                 args.image_size,
                 {
                     "best_epoch": epoch + 1,
+                    "best_combined_score": round(best_combined_score, 4),
                     "best_val_loss": round(val_m["val_loss"], 4),
                     "best_diag_val_loss": round(best_diag_val, 4),
                     "best_aux_macro_f1": round(val_m["aux_macro_f1"], 4),
+                    "best_macro_sensitivity": round(eval_m["pure_macro_sensitivity"], 4),
+                    "best_normal_bias_rate": round(eval_m["pure_abnormal_normal_bias"], 4),
+                    "best_false_alarm_rate": round(eval_m["pure_false_alarm_rate"], 4),
                     "aux_loss_weight": args.aux_loss_weight,
                 },
             )
-            print(f"[Trainer] New best checkpoint saved to {out_dir} (epoch {epoch + 1}, diag_val={best_diag_val:.4f})")
+            print(
+                f"[Trainer] New best checkpoint saved to {out_dir} "
+                f"(epoch {epoch + 1}, combined_score={best_combined_score:.4f}, diag_val={best_diag_val:.4f})"
+            )
 
     # Remove training hook cleanly before running generation audit
     if vis_hook is not None:
@@ -995,7 +1021,7 @@ def main() -> None:
         device=device,
         amp_dtype=amp_dtype,
         image_size=args.image_size,
-        max_eval=2 if args.dry_run_steps > 0 else 30,
+        max_eval=2 if args.dry_run_steps > 0 else args.eval_val_samples,
     )
     print(f"[Trainer] Pure-Mode Validation Audit Metrics: {metrics}")
 

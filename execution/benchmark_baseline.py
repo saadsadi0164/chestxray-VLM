@@ -171,7 +171,7 @@ def _score_record(study: dict[str, Any], report_text: str, latency_sec: float) -
     pred_present = sorted(k for k, v in status_map.items() if v == "present")
     pred_uncertain = sorted(k for k, v in status_map.items() if v == "uncertain")
     rulebook_ok, rulebook_errs = validate_rulebook_compliance(report_text)
-    reported_normal = len(pred_present) == 0
+    reported_normal = (len(pred_present) == 0) and (len(pred_uncertain) == 0)
 
     gt_is_normal = len(study["gt_findings"]) == 0
     return {
@@ -189,7 +189,7 @@ def _score_record(study: dict[str, Any], report_text: str, latency_sec: float) -
         "rulebook_errors": rulebook_errs,
         "reported_normal": reported_normal,
         "normal_bias": (not gt_is_normal) and reported_normal,
-        "false_alarm": gt_is_normal and (not reported_normal),
+        "false_alarm": gt_is_normal and (len(pred_present) > 0),
         "latency_seconds": round(float(latency_sec), 3),
     }
 

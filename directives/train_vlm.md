@@ -8,13 +8,16 @@ Train `HuggingFaceTB/SmolVLM-500M-Instruct` across diverse multi-institutional c
 - Training previously targeted only LLM decoder projections (`q/k/v/o/gate/up/down_proj`), leaving the ViT `out_proj` and `connector` modality projector frozen.
 
 ## Execution Tools (Layer 3)
-1. **Dataset Synthesizer:** [`execution/build_rulebook_dataset.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/build_rulebook_dataset.py)
-2. **Rulebook QLoRA/LoRA Trainer:** [`execution/train_rulebook_vlm.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/train_rulebook_vlm.py)
+1. **Canonical Preprocessor:** [`execution/preprocess.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/preprocess.py)
+2. **Dataset Synthesizer:** [`execution/build_rulebook_dataset.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/build_rulebook_dataset.py)
+3. **Rulebook QLoRA/LoRA Trainer:** [`execution/train_rulebook_vlm.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/train_rulebook_vlm.py)
+4. **Negation-Aware Validation & Benchmark Tools:** [`execution/report_parser.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/report_parser.py), [`execution/benchmark_baseline.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/benchmark_baseline.py), [`execution/compare_runs.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/compare_runs.py)
 
 ## Supported Datasets (25 Unified Thoracic Classes)
-- **ChestX-Det** (`--chestx-det`): HuggingFace `natealberti/ChestX-Det` — 13 pathologies extracted from exact semantic masks (`id2label` 1..13, `255` = background) with pixel bounding boxes.
-- **PadChest-GR** (`--padchest-gr`): HuggingFace `JasonZZ0601/PadChest-GR-Xray` — grounded radiological findings, anatomical locations, and English sentences.
-- **CheXpert** (`--chexpert-hf`): HuggingFace `danjacobellis/chexpert` — frontal/AP/PA studies across 13 acute/device classes (`label == 3` positives).
+- **ChestX-Det** (`--chestx-det`): HuggingFace `natealberti/ChestX-Det` — verified 0-indexed mask IDs `0..9, 11` (skipping upstream-corrupted ID `12`) plus verified 1-to-1 official Deepwise JSON box recovery.
+- **PadChest-GR** (`--padchest-gr`): HuggingFace `JasonZZ0601/PadChest-GR-Xray` — study-grouped findings, normalized anatomical zones, and strict Normal validation.
+- **CheXpert** (`--chexpert-hf`): HuggingFace `danjacobellis/chexpert` — frontal/AP/PA studies (`Frontal/Lateral == 0`) with ClassLabel integers `0=unlabeled, 1=uncertain, 2=absent, 3=present` (NOT `-1`).
+- **SIIM-Pneumothorax** (`--siim-pneumo`): HuggingFace `nwirandx/siim-pneumothorax-256-2400` — localized connected-component pneumothorax masks.
 - **VinDr-CXR** (`--vindr-csv`, `--vindr-images`): 22 critical findings + physician bounding boxes.
 - **Custom / NIH / MIMIC-CXR / RSNA / OpenI** (`--custom-jsonl`): Normalized JSONL manifest with `image_path` and `findings: [{label, bbox, zone}]`.
 
@@ -62,7 +65,9 @@ python execution/train_rulebook_vlm.py \
 ```
 
 ## Anti-Hallucination Training Safeguards
-1. **Assistant-Only Loss Masking:** Prompt/system/`<image>` tokens are masked (`labels[:prompt_len] = -100`) so cross-entropy optimizes only the structured 3-section report.
-2. **Class Rebalancing:** `--max-normal-ratio 0.22` and `--min-class-count` prevent majority-normal collapse.
-3. **Dual-Conditioned CoT Samples:** Every image yields both a Pure-Image CoT target and a CAD-Grounded CoT target.
-4. **Validation Audit Gate:** Post-training evaluation automatically checks 5-Rule structure compliance and true-positive finding mention rate before promoting weights.
+1. **Canonical Aspect-Preserving Inputs:** Both train and validation datasets load inputs through `execution/preprocess.normalize_cxr_to_rgb` (letterboxed `512x512` RGB, 1st–99th percentile contrast stretch, never horizontally flipped).
+2. **Assistant-Only Loss Masking & Token Weighting:** Prompt/system/`<image>` tokens are masked (`labels[:prompt_len] = -100`), with decision-token weighting (`boiler=0.4x`, `findings=6.0x`, `decision=8.0x`) and training-only visual connector `AUX_CLASSES` multi-label supervision (`--aux-loss-weight 0.5`).
+3. **Class Rebalancing:** `--max-normal-ratio 0.20` and `--min-class-count 300` prevent majority-normal collapse.
+4. **3-Mode Authenticator Mix:** Emits Pure-Image CoT, CAD-Aligned Verification, and frequency-matched CAD-Rejection hard negatives with identical prompt phrasing.
+5. **Negation-Aware Checkpoint Selection:** Per-epoch pure-mode validation (`--eval-val-samples 200`, `max_eval=2` for `--dry-run-steps > 0`) uses `execution/report_parser` (`compute_clinical_metrics`) to save best checkpoints by `combined_score` (logging both `combined_score` and `diag_val_loss`).
+6. **Held-Out Hygiene:** Never train or tune on any patient in `.tmp/reports/test_manifest.jsonl` / `.tmp/reports/heldout_patient_ids.json`.

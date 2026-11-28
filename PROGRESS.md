@@ -83,8 +83,30 @@ Because full multi-dataset training (`ChestX-Det`, `VinDr-CXR`, `NIH ChestX-ray1
 
 ---
 
-## 6. Next Steps to Complete Model Retraining
+## 6. v2.2 / v2.2.1 & v3 Phases 0–2 Progress (`fix/normal-bias`)
 
-1. Run [`directives/train_vlm.md`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/directives/train_vlm.md) on a CUDA GPU (Kaggle / Colab / RunPod) with `ChestX-Det` + `VinDr-CXR` + `NIH` / `CheXpert` / `OpenI`.
-2. Save the resulting adapter (`rulebook_v2.json` included automatically) and replace `./chestxray_smolvlm_lora` (or pass `--adapter ./chestxray_smolvlm_lora_v2`).
-3. Benchmark before vs. after hallucination rates and per-etiology recall using `evaluate_ensemble.py` + `train_rulebook_vlm.py` validation compliance metrics.
+### Pre-v3 Foundation (`v2.2` / `v2.2.1` on `main` @ `3e4c269`)
+- Added unified 3-mode rulebook data emission (`pure`, `cad_aligned`, `cad_reject`), streaming HF loaders (`ChestX-Det` 0-indexed `0..9, 11` skipping corrupted ID `12` + Deepwise JSON recovery, `CheXpert` ClassLabel `0/1/2/3`, `PadChest-GR`, `SIIM-Pneumothorax`), Visual Connector Auxiliary Classification Head (`AUX_CLASSES`), 20x decision-token weighting, T4 `fp16` `GradScaler` + `fp32` aux-head AMP guard, immediate `vis_hook.clear()` VRAM release, and stratified holdout evaluation (`execution/benchmark_etiologies.py`).
+
+### v3 Phase 0 — Fixed Patient-Grouped Held-Out Set & Baseline (`86499a9`)
+- Installed `datasets` cleanly in macOS `.venv` (no CUDA pins) and kept all 22 pre-existing tests passing.
+- Built fixed 300-study patient-grouped holdout manifest ([`execution/build_heldout_test_set.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/build_heldout_test_set.py)) -> `.tmp/reports/test_manifest.jsonl`: **100 Normal, 200 Abnormal** across all 8 priority finding groups (`Pneumothorax`, `Effusion`, `Consolidation`, `Cardiomegaly`, `Edema`, `Nodule`/`Mass`, `Atelectasis`, `Fracture`), with **300 unique patient IDs** and zero overlap asserted (`.tmp/reports/heldout_patient_ids.json`).
+- Created resumable evaluator [`execution/benchmark_baseline.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/benchmark_baseline.py) (atomic checkpoints every 25 studies) and evaluated `./chestxray_smolvlm_lora` (`pure_vlm`).
+
+### v3 Phase 1 — Canonical Aspect-Preserving Preprocessing & Safe MPS `fp32` (`c519b94`)
+- Created [`execution/preprocess.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/preprocess.py) (`normalize_cxr_to_rgb`) supporting PIL, 8/16-bit PNG, JPEG, and DICOM (`pydicom` RescaleSlope/Intercept, `MONOCHROME1` inversion, WindowCenter/Width, graceful fallback), applying 1st–99th percentile contrast stretch on native anatomy followed by symmetric centered letterbox padding BEFORE resizing to `512x512` RGB.
+- Unified preprocessing across `build_rulebook_dataset.py`, `train_rulebook_vlm.py` (`RulebookCXRDataset.__getitem__` and validation eval), and `analyze_xray.py` (both v1 and v2/v3 paths).
+- Changed `resolve_llm_device` in [`execution/analyze_xray.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/analyze_xray.py) so Apple Silicon MPS defaults to `torch.float32` (`allow_mps_bf16=False`).
+- Verified byte-identical train/inference tensors and zero-NaN generation on 5 held-out studies (`tests/test_preprocess_and_precision.py`). Re-running baseline benchmark cut Normal False-Alarm Rate roughly in half (`11.0% -> 5.0%` raw; `13.0% -> 7.0%` rescored).
+
+### v3 Phase 2 — Negation-Aware Parser, Combined Checkpoint Scoring & Run Comparison
+- Created [`execution/report_parser.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/report_parser.py) (`parse_report_findings`, `compute_clinical_metrics`) returning `"present" | "absent" | "uncertain"` for every canonical pathology class, handling comma-separated negative lists, prepositional negations, trailing passive negations, contrast conjunctions, clinical hedges, and Mode-3 CAD refutations.
+- Updated [`execution/train_rulebook_vlm.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/train_rulebook_vlm.py) to score `--eval-val-samples 200` (`max_eval=2` for dry runs) per epoch via `parse_report_findings` and select best checkpoints by `combined_score` (logging both `combined_score` and `diag_val_loss`).
+- Added [`execution/compare_runs.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/compare_runs.py), rescored both Phase 0 and Phase 1 runs, and spot-checked 20 reports against human reading:
+  - Phase 0 (`baseline_v1`, MPS `fp16`, raw squashed): Normal-Bias **86.5%** (173/200), False-Alarm **13.0%** (13/100), Macro Sens **0.3%**, 5-Rule Comp **0.0%**, Combined **-0.4297**.
+  - Phase 1 (`baseline_v1_phase1`, MPS `fp32`, canonical letterbox): Normal-Bias **85.0%** (170/200), False-Alarm **7.0%** (7/100), Macro Sens **0.1%**, 5-Rule Comp **0.0%**, Combined **-0.4239**.
+
+## 7. Next Steps (Phase 3+)
+1. Build leak-free multi-dataset training shards excluding `.tmp/reports/heldout_patient_ids.json`.
+2. Execute cloud GPU (Kaggle T4 / Colab) QLoRA/LoRA retraining with `execution/train_rulebook_vlm.py` (`combined_score` checkpoint selection).
+3. Benchmark retrained v3 adapter on the fixed 300-study held-out `.tmp/reports/test_manifest.jsonl` via `execution/benchmark_baseline.py` and `execution/compare_runs.py`.

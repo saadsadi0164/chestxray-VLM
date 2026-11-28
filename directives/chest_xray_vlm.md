@@ -11,8 +11,11 @@ Execute deterministic, hallucination-resistant multimodal analysis of frontal ch
 - **Pipeline Mode**: `audited` (Stage 1 + Stage 2, default) or `pure_vlm` (standalone SmolVLM+LoRA CoT).
 
 ## Execution Tools (Layer 3)
+- **Canonical Preprocessing:** [`execution/preprocess.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/preprocess.py)
 - **Ensemble CAD Engine:** [`execution/ensemble_cad.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/ensemble_cad.py)
 - **Unified VLM + Rulebook Pipeline:** [`execution/analyze_xray.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/analyze_xray.py)
+- **Negation-Aware Report Parser:** [`execution/report_parser.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/report_parser.py)
+- **Held-Out Manifest & Baselines:** [`execution/build_heldout_test_set.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/build_heldout_test_set.py), [`execution/benchmark_baseline.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/benchmark_baseline.py), [`execution/compare_runs.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/execution/compare_runs.py)
 - **Interactive Gradio Workstation:** [`app.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/app.py)
 - **Offline CLI Runner:** [`inference.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/inference.py)
 - **Batch CSV Evaluator:** [`evaluate_ensemble.py`](file:///Users/saadsadi/Desktop/chest%20x-ray%20VLM/evaluate_ensemble.py)
@@ -27,8 +30,11 @@ Execute deterministic, hallucination-resistant multimodal analysis of frontal ch
 - Batch CSV telemetry and CAM overlays saved under `./.tmp/ensemble_audit_outputs/`.
 
 ## Edge Cases & Learnings
+- **Single Aspect-Preserving Preprocessing:** All training and inference paths (both v1 and v2/v3 adapters) MUST call `execution/preprocess.normalize_cxr_to_rgb` (1st–99th percentile contrast stretch BEFORE symmetric black letterbox padding and `512x512` RGB resize, with optional `pydicom` RescaleSlope/Intercept, `MONOCHROME1` inversion, and windowing).
+- **Safe Apple Silicon Precision:** `resolve_llm_device` defaults MPS to `torch.float32` (`allow_mps_bf16=False`) to avoid fp16/bf16 logit instability and reduce false-alarm hallucinations.
 - **Image Splitting:** Always keep `processor.image_processor.do_image_splitting = False` on `SmolVLM-500M-Instruct` — splitting induces anatomical laterality hallucinations.
 - **CAM Weight Normalization:** Always track `cam_weights_224[label]` and `cam_weights_512[label]` separately from total ensemble `weights[label]` because 7 of 18 classes are missing from CheXpert/MIMIC DenseNets and 2 classes have NaN thresholds in ResNet50-512.
-- **Clause-Level Negation:** Always split sentences on clause delimiters before negation masking so a normal first clause cannot mask a hallucinated pathology later in the sentence.
+- **Clause-Level Negation & Parsing:** Always split sentences on clause delimiters before negation masking, and use `execution/report_parser.parse_report_findings` (comma-list continuation + hedge awareness) for benchmark evaluation.
+- **Held-Out Patient Hygiene:** Never train or tune on any patient listed in `.tmp/reports/heldout_patient_ids.json`.
 - **Offline Cache:** Check `./.tmp/torchxrayvision/models_data` and `~/.torchxrayvision/models_data` before downloading, and use `local_files_only=True` fallback for HuggingFace assets.
 - **Medical Disclaimer:** All outputs must carry non-diagnostic research disclaimers.
