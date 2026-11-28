@@ -50,6 +50,45 @@ from execution.report_parser import compute_clinical_metrics, parse_report_findi
 AUX_CLASSES: list[str] = sorted(PATHOLOGY_ONTOLOGY.keys()) + ["Normal"]
 AUX_CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(AUX_CLASSES)}
 
+# Exact subset of canonical classes actually annotated by each source so partial-label
+# datasets NEVER receive false-negative `target=0` gradients for unannotated findings.
+SOURCE_ANNOTATED_CLASSES: dict[str, set[str]] = {
+    "chestx-det": {
+        "Atelectasis", "Calcification", "Cardiomegaly", "Consolidation", "Effusion",
+        "Emphysema", "Fibrosis", "Fracture", "Mass", "Nodule", "Pleural Thickening",
+        "Pneumothorax", "Normal",
+    },
+    "chexpert": {
+        "Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion",
+        "Edema", "Consolidation", "Pneumonia", "Atelectasis", "Pneumothorax",
+        "Effusion", "Fracture", "Support Devices", "Normal",
+    },
+    "padchest": set(AUX_CLASSES),
+    "siim": {"Pneumothorax"},
+}
+
+
+def _source_to_aux_mask(source: str | None) -> torch.Tensor:
+    """Returns float32 [len(AUX_CLASSES)] mask (1.0=annotated by source, 0.0=unannotated)."""
+    src = str(source or "").strip().lower()
+    if "siim" in src:
+        allowed = SOURCE_ANNOTATED_CLASSES["siim"]
+    elif "chestx-det" in src or "chestx_det" in src:
+        allowed = SOURCE_ANNOTATED_CLASSES["chestx-det"]
+    elif "chexpert" in src:
+        allowed = SOURCE_ANNOTATED_CLASSES["chexpert"]
+    elif "padchest" in src:
+        allowed = SOURCE_ANNOTATED_CLASSES["padchest"]
+    else:
+        return torch.ones(len(AUX_CLASSES), dtype=torch.float32)
+
+    mask = torch.zeros(len(AUX_CLASSES), dtype=torch.float32)
+    for cls in allowed:
+        idx = AUX_CLASS_TO_IDX.get(cls)
+        if idx is not None:
+            mask[idx] = 1.0
+    return mask
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -272,12 +311,15 @@ class RulebookCXRDataset(Dataset):
         self.augment = augment
 
     def compute_aux_pos_weights(self, max_weight: float = 6.0) -> torch.Tensor:
-        """Computes capped positive class weights so rare pathologies get strong visual recall gradients."""
-        total = max(1, len(self.samples))
+        """Computes capped positive class weights across source-annotated studies per class."""
+        annotated = torch.zeros(len(AUX_CLASSES), dtype=torch.float32)
         pos = torch.zeros(len(AUX_CLASSES), dtype=torch.float32)
         for s in self.samples:
-            pos += _labels_to_multihot(s.get("labels") or [])
-        neg = (total - pos).clamp_min(1.0)
+            m = _source_to_aux_mask(s.get("source"))
+            t = _labels_to_multihot(s.get("labels") or []) * m
+            annotated += m
+            pos += t
+        neg = (annotated - pos).clamp_min(1.0)
         raw = torch.where(pos > 0, neg / pos.clamp_min(1.0), torch.ones_like(pos))
         return raw.clamp(min=1.0, max=max_weight)
 
@@ -355,6 +397,7 @@ class RulebookCXRDataset(Dataset):
         batch["labels"] = labels
         batch["loss_weights"] = loss_weights
         batch["aux_targets"] = _labels_to_multihot(item.get("labels") or [])
+        batch["aux_mask"] = _source_to_aux_mask(item.get("source"))
         return batch
 
 
@@ -677,7 +720,8 @@ def compute_multitask_loss(
     labels = batch["labels"]
     loss_weights = batch.get("loss_weights")
     aux_targets = batch.get("aux_targets")
-    model_inputs = {k: v for k, v in batch.items() if k not in ("labels", "loss_weights", "aux_targets")}
+    aux_mask = batch.get("aux_mask")
+    model_inputs = {k: v for k, v in batch.items() if k not in ("labels", "loss_weights", "aux_targets", "aux_mask")}
 
     if vis_hook is not None:
         vis_hook.clear()
@@ -724,6 +768,9 @@ def compute_multitask_loss(
         bsz = int(labels.shape[0])
         fp32_ctx = torch.amp.autocast(device_type="cuda", enabled=False) if lm_loss.is_cuda else contextlib.nullcontext()
         with fp32_ctx:
+            if captured.shape[0] % bsz != 0:
+                raise ValueError(f"Captured connector batch {captured.shape[0]} is not divisible by bsz={bsz}")
+            # Flattens multi-tile outputs [B*num_tiles, 64, H] or [B, num_tiles, 64, H] -> [B, N_vis_tokens, H]
             vis_seq = captured.reshape(bsz, -1, captured.shape[-1]).float()
             expected_in = _extract_aux_in_dim(aux_head)
             if expected_in == 2 * int(vis_seq.shape[-1]):
@@ -732,11 +779,17 @@ def compute_multitask_loss(
                 vis_emb = vis_seq.mean(dim=1)
             aux_logits = aux_head(vis_emb)
             pos_w = aux_pos_weight.float() if aux_pos_weight is not None else None
-            aux_loss = F.binary_cross_entropy_with_logits(
+            per_elem_bce = F.binary_cross_entropy_with_logits(
                 aux_logits.float(),
                 aux_targets.float(),
                 pos_weight=pos_w,
+                reduction="none",
             )
+            if aux_mask is not None:
+                mask_f = aux_mask.to(device=per_elem_bce.device, dtype=torch.float32)
+                aux_loss = (per_elem_bce * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+            else:
+                aux_loss = per_elem_bce.mean()
         total_loss = lm_loss + aux_loss_weight * aux_loss
     else:
         total_loss = lm_loss
@@ -790,9 +843,13 @@ def compute_validation_metrics(
         if a_logits is not None and "aux_targets" in batch:
             preds = (torch.sigmoid(a_logits).cpu() >= 0.5).to(torch.float64)
             targs = (batch["aux_targets"].cpu() >= 0.5).to(torch.float64)
-            tp += (preds * targs).sum(dim=0)
-            fp += (preds * (1.0 - targs)).sum(dim=0)
-            fn += ((1.0 - preds) * targs).sum(dim=0)
+            if "aux_mask" in batch:
+                m = (batch["aux_mask"].cpu() >= 0.5).to(torch.float64)
+            else:
+                m = torch.ones_like(targs)
+            tp += (preds * targs * m).sum(dim=0)
+            fp += (preds * (1.0 - targs) * m).sum(dim=0)
+            fn += ((1.0 - preds) * targs * m).sum(dim=0)
 
     if vis_hook is not None:
         vis_hook.clear()
@@ -909,16 +966,21 @@ def save_adapter_bundle(
     extra_meta: dict[str, Any] | None = None,
     aux_head: nn.Module | None = None,
     format_version: str = "v3",
+    do_image_splitting: bool | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir)
     processor.save_pretrained(out_dir)
+    if do_image_splitting is None:
+        img_proc = getattr(processor, "image_processor", None)
+        do_image_splitting = bool(getattr(img_proc, "do_image_splitting", False))
     meta = {
         "rulebook_format": f"chestxstudio-{format_version}",
         "format_version": format_version,
         "adapt_vision": adapt_vision,
         "image_size": image_size,
-        "do_image_splitting": False,
+        "do_image_splitting": bool(do_image_splitting),
+        "image_longest_edge": (2 * image_size if do_image_splitting else image_size),
         "uniform_norm": True,
     }
     if extra_meta:
@@ -959,6 +1021,12 @@ def main() -> None:
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument(
+        "--image-splitting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable 5-tile high-resolution splitting (320 visual tokens; default True for v3).",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--quantize-4bit", action="store_true", help="Enable NF4 QLoRA (CUDA GPU only).")
@@ -990,7 +1058,10 @@ def main() -> None:
     except Exception:
         processor = AutoProcessor.from_pretrained(args.base_model, local_files_only=False)
 
-    processor.image_processor.do_image_splitting = False
+    use_image_splitting = bool(args.image_splitting)
+    processor.image_processor.do_image_splitting = use_image_splitting
+    if use_image_splitting and hasattr(processor.image_processor, "size"):
+        processor.image_processor.size = {"longest_edge": 2 * args.image_size}
     pad_id = int(processor.tokenizer.pad_token_id or 0)
 
     train_ds = RulebookCXRDataset(
@@ -1016,7 +1087,7 @@ def main() -> None:
 
     print(
         f"[Trainer {format_version}] Device={device} | AMP dtype={amp_dtype} | 4-bit={args.quantize_4bit} | "
-        f"Image={args.image_size}px | FindingsWeight={args.findings_weight:.1f}x | "
+        f"Image={args.image_size}px | ImageSplitting={use_image_splitting} | FindingsWeight={args.findings_weight:.1f}x | "
         f"AuxLoss={args.aux_loss_weight} | Augment={not args.no_augment}"
     )
 
@@ -1105,6 +1176,7 @@ def main() -> None:
             {"verify_startup_only": True},
             aux_head=aux_head,
             format_version=format_version,
+            do_image_splitting=use_image_splitting,
         )
         if vis_hook is not None:
             vis_hook.remove()
@@ -1228,6 +1300,7 @@ def main() -> None:
                 {"dry_run": True},
                 aux_head=aux_head,
                 format_version=format_version,
+                do_image_splitting=use_image_splitting,
             )
             print(f"[Trainer] Dry-run complete. Saved checkpoint (+ aux_head.pt) to {out_dir}")
             break
@@ -1286,6 +1359,7 @@ def main() -> None:
                 },
                 aux_head=aux_head,
                 format_version=format_version,
+                do_image_splitting=use_image_splitting,
             )
             print(
                 f"[Trainer] New best checkpoint saved to {out_dir} "

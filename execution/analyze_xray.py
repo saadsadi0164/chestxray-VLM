@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gc
 import glob
+import json
 import os
 import re
 import sys
@@ -342,6 +343,25 @@ class ChestXRayPipeline:
         self.llm_model = None
         self._load_vlm()
 
+    def _resolve_image_splitting_config(self) -> tuple[bool, int]:
+        """Reads v3/v2 adapter metadata for image splitting (defaults False for v1/v2 backward compatibility)."""
+        if not self.use_lora:
+            return False, 512
+        for fname in ("rulebook_v3.json", "rulebook_v2.json"):
+            meta_path = os.path.join(self.adapter_path, fname)
+            if not os.path.isfile(meta_path):
+                continue
+            try:
+                with open(meta_path, encoding="utf-8") as mf:
+                    meta = json.load(mf)
+                split_enabled = bool(meta.get("do_image_splitting", False))
+                img_size = int(meta.get("image_size", 512) or 512)
+                longest_edge = int(meta.get("image_longest_edge") or (2 * img_size if split_enabled else img_size))
+                return split_enabled, longest_edge
+            except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                continue
+        return False, 512
+
     def _load_vlm(self) -> None:
         print(f"[VLM Engine] Loading {self.base_model_id} on {self.llm_device.upper()} ({self.llm_dtype})...")
         proc_source = self.adapter_path if self.use_lora else self.base_model_id
@@ -350,7 +370,10 @@ class ChestXRayPipeline:
         except Exception:
             self.processor = _load_hf_with_offline_fallback(AutoProcessor.from_pretrained, self.base_model_id)
 
-        self.processor.image_processor.do_image_splitting = False
+        self.do_image_splitting, self.image_longest_edge = self._resolve_image_splitting_config()
+        self.processor.image_processor.do_image_splitting = self.do_image_splitting
+        if self.do_image_splitting and hasattr(self.processor.image_processor, "size"):
+            self.processor.image_processor.size = {"longest_edge": self.image_longest_edge}
         if hasattr(self.processor, "tokenizer"):
             self.processor.tokenizer.padding_side = "left"
 

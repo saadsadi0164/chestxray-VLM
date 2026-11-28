@@ -1125,12 +1125,18 @@ def load_siim_pneumo_hf(
     image_size: int = 512,
     split: str = "train",
     streaming: bool = True,
+    positives_only: bool = False,
 ) -> list[dict[str, Any]]:
-    """Streams nwirandx/siim-pneumothorax-256-2400 with uniform contrast normalization & CC boxes."""
+    """
+    Streams nwirandx/siim-pneumothorax-256-2400 with uniform contrast normalization & CC boxes.
+    When `positives_only=True` (recommended for training), drops `has_pneumo == 0` scans so
+    unlabeled NIH non-pneumothorax pathologies are NEVER poisoned into Normal targets.
+    """
     import numpy as np
     from datasets import load_dataset
 
-    print(f"[Loader] Streaming SIIM-Pneumothorax ({split}, uniform norm)...", flush=True)
+    mode_tag = ", positives only" if positives_only else ""
+    print(f"[Loader] Streaming SIIM-Pneumothorax ({split}, uniform norm{mode_tag})...", flush=True)
     ds = load_dataset("nwirandx/siim-pneumothorax-256-2400", split=split, streaming=streaming)
     out_img_dir = Path(img_cache_dir) / f"siim_pneumo_{split}"
     out_img_dir.mkdir(parents=True, exist_ok=True)
@@ -1139,13 +1145,15 @@ def load_siim_pneumo_hf(
     for idx, row in enumerate(ds):
         if max_samples and len(records) >= max_samples:
             break
+        has_pneumo = int(row.get("has_pneumo", 0) or 0) == 1
+        if positives_only and not has_pneumo:
+            continue
         pil_img = row.get("image")
         if pil_img is None:
             continue
         img_w, img_h = pil_img.size
         img_file = _save_resized_image(pil_img, out_img_dir / f"siim_pneumo_{split}_{idx:06d}.jpg", image_size)
 
-        has_pneumo = int(row.get("has_pneumo", 0) or 0) == 1
         findings: list[dict[str, Any]] = []
         if has_pneumo:
             mask_img = row.get("mask")
@@ -1387,8 +1395,10 @@ def balance_records_against_normal_bias(
     Rebalances training dataset to eradicate "Normal-biased" and source-shortcut learning:
       - Oversamples underrepresented etiologies up to `min_class_count`, tagging copies
         with incrementing `aug_variant: k` so training applies distinct non-flip jitter.
-      - Enforces per-source Normal balance (~50/50 for SIIM-Pneumothorax; ~20-25% for
-        other sources with Normals) while capping global Normals at `max_normal_ratio`.
+      - Enforces per-source Normal balance among sources that carry verified Normals
+        (~50/50 if SIIM Normals are present, or skipped cleanly when positives-only SIIM
+        has 0 Normal records; ~22% within multi-label sources), while capping global
+        Normals at `max_normal_ratio`.
     """
     rng = random.Random(seed)
     normal_recs = [_copy_with_variant(r, 0) for r in records if not r["findings"]]
@@ -1420,6 +1430,10 @@ def balance_records_against_normal_bias(
                 copy_counter[pid] += 1
                 balanced_abn.append(_copy_with_variant(base_rec, copy_counter[pid]))
 
+    if not normal_recs:
+        rng.shuffle(balanced_abn)
+        return balanced_abn
+
     # Per-source Normal allocation under global max_normal_ratio cap
     max_globals = max(1, int(len(balanced_abn) * (max_normal_ratio / max(1e-5, 1.0 - max_normal_ratio))))
     abn_by_src: Counter[str] = Counter(str(r.get("source", "default")) for r in balanced_abn)
@@ -1427,6 +1441,7 @@ def balance_records_against_normal_bias(
     for r in normal_recs:
         norm_by_src[str(r.get("source", "default"))].append(r)
 
+    # Positives-only sources (e.g. SIIM with positives_only=True) have 0 Normals and are intentionally excluded.
     siim_srcs = [s for s in norm_by_src if "siim" in s.lower()]
     other_srcs = [s for s in norm_by_src if "siim" not in s.lower()]
 
@@ -1899,6 +1914,8 @@ def main() -> None:
                 max_samples=args.max_per_source,
                 img_cache_dir=args.img_cache_dir,
                 image_size=args.image_size,
+                split="train",
+                positives_only=True,
             ))
         if args.vindr_csv and args.vindr_images:
             records.extend(load_vindr_csv(args.vindr_csv, args.vindr_images, max_samples=args.max_per_source))

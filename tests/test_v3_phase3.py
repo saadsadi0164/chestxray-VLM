@@ -25,6 +25,7 @@ import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -34,7 +35,7 @@ from transformers import AutoProcessor
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from execution.analyze_xray import DEFAULT_BASE_MODEL
+from execution.analyze_xray import ChestXRayPipeline, DEFAULT_BASE_MODEL
 from execution.build_rulebook_dataset import (
     PATHOLOGY_ONTOLOGY,
     assert_zero_patient_leakage,
@@ -43,6 +44,7 @@ from execution.build_rulebook_dataset import (
     filter_excluded_patients,
     format_vlm_chat_sample,
     load_excluded_patient_ids,
+    load_siim_pneumo_hf,
     split_records_by_group,
     validate_min_class_counts,
     validate_rulebook_compliance,
@@ -50,14 +52,18 @@ from execution.build_rulebook_dataset import (
 )
 from execution.report_parser import parse_report_findings
 from execution.train_rulebook_vlm import (
+    AUX_CLASS_TO_IDX,
     AUX_CLASSES,
     RulebookCXRDataset,
     VisualConnectorHook,
     _augment_cxr_nonflip,
     _compute_offset_token_weights,
     _labels_to_multihot,
+    _source_to_aux_mask,
     build_aux_visual_head,
+    collate_single_or_padded,
     compute_multitask_loss,
+    compute_validation_metrics,
     save_adapter_bundle,
     verify_loss_masking,
 )
@@ -311,6 +317,236 @@ class TestPhase3Upgrades(unittest.TestCase):
         # Variant calls produce non-identical augmented views
         arr0 = np.asarray(outputs[0])
         self.assertTrue(any(not np.array_equal(arr0, np.asarray(o)) for o in outputs[1:]))
+
+    def test_source_masked_aux_bce_zeroes_unannotated_gradients(self):
+        c_mask = _source_to_aux_mask("ChestX-Det-train")
+        self.assertEqual(float(c_mask[AUX_CLASS_TO_IDX["Nodule"]]), 1.0)
+        self.assertEqual(float(c_mask[AUX_CLASS_TO_IDX["Normal"]]), 1.0)
+        self.assertEqual(float(c_mask[AUX_CLASS_TO_IDX["Edema"]]), 0.0)
+        self.assertEqual(float(c_mask[AUX_CLASS_TO_IDX["Support Devices"]]), 0.0)
+
+        x_mask = _source_to_aux_mask("CheXpert")
+        self.assertEqual(float(x_mask[AUX_CLASS_TO_IDX["Edema"]]), 1.0)
+        self.assertEqual(float(x_mask[AUX_CLASS_TO_IDX["Normal"]]), 1.0)
+        self.assertEqual(float(x_mask[AUX_CLASS_TO_IDX["Nodule"]]), 0.0)
+        self.assertEqual(float(x_mask[AUX_CLASS_TO_IDX["Mass"]]), 0.0)
+
+        s_mask = _source_to_aux_mask("SIIM-Pneumothorax-train")
+        self.assertEqual(float(s_mask.sum().item()), 1.0)
+        self.assertEqual(float(s_mask[AUX_CLASS_TO_IDX["Pneumothorax"]]), 1.0)
+        self.assertEqual(float(s_mask[AUX_CLASS_TO_IDX["Normal"]]), 0.0)
+        self.assertEqual(float(s_mask[AUX_CLASS_TO_IDX["Edema"]]), 0.0)
+
+        p_mask = _source_to_aux_mask("PadChest-GR-train")
+        self.assertEqual(int(p_mask.sum().item()), len(AUX_CLASSES))
+
+        hidden = 16
+        model = _DummyPatchVLM(hidden=hidden, vocab=64)
+        hook = VisualConnectorHook(model)
+        aux_head = nn.Linear(2 * hidden, len(AUX_CLASSES))
+
+        # Keep LM labels all -100 so backward gradients isolate exact aux_head output classes
+        ptx_idx = AUX_CLASS_TO_IDX["Pneumothorax"]
+        batch = collate_single_or_padded([
+            {
+                "input_ids": torch.randint(1, 50, (10,)),
+                "labels": torch.full((10,), -100, dtype=torch.long),
+                "loss_weights": torch.zeros((10,), dtype=torch.float32),
+                "aux_targets": _labels_to_multihot(["Pneumothorax"]),
+                "aux_mask": s_mask,
+            }
+        ], pad_token_id=0)
+        total_loss, _, aux_loss, _ = compute_multitask_loss(
+            model, batch, vis_hook=hook, aux_head=aux_head, aux_loss_weight=1.0
+        )
+        self.assertTrue(torch.isfinite(aux_loss))
+        total_loss.backward()
+        row_grads = aux_head.weight.grad.abs().sum(dim=1)
+        self.assertGreater(float(row_grads[ptx_idx].item()), 0.0)
+        other_grads = torch.cat([row_grads[:ptx_idx], row_grads[ptx_idx + 1 :]])
+        self.assertEqual(float(other_grads.sum().item()), 0.0)
+
+        # Validation macro-F1 ignores false positives on unannotated classes when aux_mask == 0
+        class _DummyValModel(nn.Module):
+            def __init__(self, logits_val):
+                super().__init__()
+                self.connector = nn.Identity()
+                self._logits_val = logits_val
+
+            def forward(self, input_ids, **_kw):
+                bsz, seq = input_ids.shape
+                # Hook captures connector output; return zeros vocab logits
+                _ = self.connector(torch.zeros((bsz, 4, 8), dtype=torch.float32))
+                return type("Out", (), {"logits": torch.zeros((bsz, seq, 32), dtype=torch.float32)})()
+
+        val_model = _DummyValModel(None)
+        val_hook = VisualConnectorHook(val_model)
+        val_head = nn.Linear(16, len(AUX_CLASSES))
+        with torch.no_grad():
+            val_head.weight.zero_()
+            # Predict Pneumothorax (+5) AND unannotated Cardiomegaly (+5)
+            val_head.bias.fill_(-5.0)
+            val_head.bias[ptx_idx] = 5.0
+            val_head.bias[AUX_CLASS_TO_IDX["Cardiomegaly"]] = 5.0
+        val_m = compute_validation_metrics(
+            val_model,
+            [batch],
+            device="cpu",
+            amp_dtype=torch.float32,
+            vis_hook=val_hook,
+            aux_head=val_head,
+            aux_loss_weight=1.0,
+        )
+        self.assertAlmostEqual(val_m["aux_macro_f1"], 1.0, places=5)
+        hook.remove()
+        val_hook.remove()
+
+    def test_siim_positives_only_and_zero_normal_balancing(self):
+        img_pos = Image.fromarray(np.full((128, 128), 160, dtype=np.uint8), mode="L")
+        img_neg = Image.fromarray(np.full((128, 128), 140, dtype=np.uint8), mode="L")
+        mask_pos = np.zeros((128, 128), dtype=np.uint8)
+        mask_pos[10:40, 20:50] = 255
+        mask_pil = Image.fromarray(mask_pos, mode="L")
+
+        fake_rows = [
+            {"image": img_pos, "has_pneumo": 1, "mask": mask_pil, "image_id": "p1"},
+            {"image": img_neg, "has_pneumo": 0, "mask": None, "image_id": "n1"},
+            {"image": img_pos, "has_pneumo": 1, "mask": mask_pil, "image_id": "p2"},
+            {"image": img_neg, "has_pneumo": 0, "mask": None, "image_id": "n2"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("datasets.load_dataset", return_value=fake_rows):
+                pos_recs = load_siim_pneumo_hf(
+                    img_cache_dir=tmpdir, image_size=256, split="train", streaming=True, positives_only=True
+                )
+                all_recs = load_siim_pneumo_hf(
+                    img_cache_dir=tmpdir, image_size=256, split="test", streaming=True, positives_only=False
+                )
+
+            self.assertEqual(len(pos_recs), 2)
+            self.assertTrue(all(len(r["findings"]) >= 1 and r["findings"][0]["label"] == "Pneumothorax" for r in pos_recs))
+            train_cached = list((Path(tmpdir) / "siim_pneumo_train").glob("*.jpg"))
+            self.assertEqual(len(train_cached), 2)
+            self.assertEqual(len(all_recs), 4)
+
+        # Zero-Normal SIIM alongside mixed ChestX-Det balances cleanly without error
+        synthetic_recs = list(pos_recs)
+        for i in range(6):
+            synthetic_recs.append({
+                "source": "ChestX-Det-train",
+                "patient_id": f"cxd_abn_{i}",
+                "group_id": f"cxd_abn_{i}",
+                "image_path": f"cxd_a_{i}.jpg",
+                "findings": [{"label": "Effusion", "zone": "left costophrenic angle and lower pleural space"}],
+            })
+        for i in range(6):
+            synthetic_recs.append({
+                "source": "ChestX-Det-train",
+                "patient_id": f"cxd_norm_{i}",
+                "group_id": f"cxd_norm_{i}",
+                "image_path": f"cxd_n_{i}.jpg",
+                "findings": [],
+            })
+
+        bal = balance_records_against_normal_bias(synthetic_recs, max_normal_ratio=0.20, min_class_count=10, seed=7)
+        siim_norms = [r for r in bal if "siim" in r["source"].lower() and not r["findings"]]
+        all_norms = [r for r in bal if not r["findings"]]
+        self.assertEqual(len(siim_norms), 0)
+        self.assertGreater(len(all_norms), 0)
+        self.assertLessEqual(len(all_norms) / len(bal), 0.25)
+        counts = validate_min_class_counts(bal, min_class_count=10, strict=True)
+        self.assertGreaterEqual(counts["Pneumothorax"], 10)
+        self.assertGreaterEqual(counts["Effusion"], 10)
+
+    def test_multitile_320_tokens_and_inference_image_splitting_config(self):
+        class _DummyMultiTileVLM(nn.Module):
+            def __init__(self, hidden: int = 32, num_tiles: int = 5, tokens_per_tile: int = 64, vocab: int = 128):
+                super().__init__()
+                self.num_tiles = num_tiles
+                self.tokens_per_tile = tokens_per_tile
+                self.connector = nn.Linear(hidden, hidden)
+                self.lm_head = nn.Linear(hidden, vocab)
+
+            def forward(self, input_ids, pixel_values=None, **_kwargs):
+                bsz, seq = input_ids.shape
+                n_tiles = pixel_values.shape[1] if (pixel_values is not None and pixel_values.ndim == 5) else self.num_tiles
+                vis_in = torch.zeros((bsz * n_tiles, self.tokens_per_tile, self.connector.in_features), dtype=torch.float32)
+                vis_in[:, 0, :] = 2.5
+                vis_out = self.connector(vis_in)
+                pooled = vis_out.reshape(bsz, n_tiles * self.tokens_per_tile, -1).mean(dim=1, keepdim=True)
+                return type("Out", (), {"logits": self.lm_head(pooled.expand(bsz, seq, -1))})()
+
+            def save_pretrained(self, out_dir: Path) -> None:
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+                (Path(out_dir) / "adapter_config.json").write_text('{"r": 32}', encoding="utf-8")
+
+        hidden = 32
+        model = _DummyMultiTileVLM(hidden=hidden, num_tiles=5, tokens_per_tile=64, vocab=128)
+        hook = VisualConnectorHook(model)
+        aux_head = build_aux_visual_head(hidden, len(AUX_CLASSES))
+        batch = {
+            "input_ids": torch.randint(1, 100, (2, 14)),
+            "labels": torch.randint(1, 100, (2, 14)),
+            "loss_weights": torch.ones((2, 14), dtype=torch.float32),
+            "pixel_values": torch.zeros((2, 5, 3, 64, 64), dtype=torch.float32),
+            "aux_targets": torch.stack([_labels_to_multihot(["Pneumothorax"]), _labels_to_multihot([])]),
+            "aux_mask": torch.stack([_source_to_aux_mask("SIIM"), _source_to_aux_mask("ChestX-Det")]),
+        }
+        total_loss, _, aux_loss, aux_logits = compute_multitask_loss(
+            model, batch, vis_hook=hook, aux_head=aux_head, aux_loss_weight=1.0
+        )
+        self.assertIsNone(hook.captured)
+        self.assertEqual(tuple(aux_logits.shape), (2, len(AUX_CLASSES)))
+        self.assertTrue(torch.isfinite(total_loss))
+        self.assertTrue(torch.isfinite(aux_loss))
+        total_loss.backward()
+        self.assertGreater(float(model.connector.weight.grad.abs().sum().item()), 0.0)
+        hook.remove()
+
+        # Verify save_adapter_bundle + ChestXRayPipeline._resolve_image_splitting_config
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "v3_split_ckpt"
+            save_adapter_bundle(
+                model,
+                _DummyProc(),
+                out,
+                adapt_vision=True,
+                image_size=512,
+                aux_head=aux_head,
+                format_version="v3",
+                do_image_splitting=True,
+            )
+            meta = json.loads((out / "rulebook_v3.json").read_text(encoding="utf-8"))
+            self.assertTrue(meta["do_image_splitting"])
+            self.assertEqual(meta["image_longest_edge"], 1024)
+
+            pipe = ChestXRayPipeline.__new__(ChestXRayPipeline)
+            pipe.use_lora = True
+            pipe.adapter_path = str(out)
+            self.assertEqual(pipe._resolve_image_splitting_config(), (True, 1024))
+
+            # Missing rulebook JSON -> False (v1/v2 backward-compatible)
+            empty_dir = Path(tmpdir) / "v1_ckpt"
+            empty_dir.mkdir(parents=True, exist_ok=True)
+            pipe.adapter_path = str(empty_dir)
+            self.assertEqual(pipe._resolve_image_splitting_config(), (False, 512))
+
+        # Verify AutoProcessor produces 5 tiles (320 visual tokens) when cached locally
+        try:
+            proc = AutoProcessor.from_pretrained(DEFAULT_BASE_MODEL, local_files_only=True)
+        except Exception:
+            proc = None
+        if proc is not None:
+            proc.image_processor.do_image_splitting = True
+            proc.image_processor.size = {"longest_edge": 1024}
+            p_txt = proc.apply_chat_template(
+                [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Inspect."}]}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            enc = proc(text=[p_txt], images=[[Image.new("RGB", (512, 512), (120, 120, 120))]], return_tensors="pt")
+            self.assertEqual(enc["pixel_values"].shape[1], 5)
 
 
 if __name__ == "__main__":
